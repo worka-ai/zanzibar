@@ -1,0 +1,49 @@
+name: Nightly Benchmark
+on:
+#  schedule:
+#    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: worka
+          POSTGRES_PASSWORD: worka
+          POSTGRES_DB: worka
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Fetch previous benchmark data
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download benchmark-baseline -n criterion-baseline.tar.gz || echo "No baseline found"
+          tar -xzf criterion-baseline.tar.gz || true
+
+      - name: Run criterion benchmarks
+        run: cargo bench
+
+      - name: Upload new benchmark data
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tar -czf criterion-baseline.tar.gz target/criterion/
+          gh release view benchmark-baseline || gh release create benchmark-baseline --title "Benchmark Baseline" --notes "Automated baseline data"
+          gh release upload benchmark-baseline criterion-baseline.tar.gz --clobber
+
+      - name: Run stress test
+        run: cargo run --release --bin stress_test
