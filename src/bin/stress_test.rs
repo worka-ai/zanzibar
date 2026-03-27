@@ -1,12 +1,10 @@
 use sqlx::PgPool;
+use std::collections::HashMap;
 use std::env;
 use std::time::Instant;
 use tokio::task::JoinSet;
 use zanzibar::postgres::PostgresRebacEngine;
-use zanzibar::{
-    NamespaceConfig, Object, RebacEngine, RelationRule, SchemaBuilder, Subject,
-};
-use std::collections::HashMap;
+use zanzibar::{NamespaceConfig, Object, RebacEngine, RelationRule, SchemaBuilder, Subject};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -84,7 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Fast Bulk Generation via COPY
     println!("Generating and writing {} rows via COPY CSV...", rows);
     let start_insert = Instant::now();
-    
+
     let mut tx = pool.begin().await?;
     let mut copy_in = tx.copy_in_raw(
         "COPY zanzibar_tuple (tenant_id, object_namespace, object_id, relation, subject_namespace, subject_id, subject_relation) FROM STDIN WITH (FORMAT csv)"
@@ -92,35 +90,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let batch_size = 100_000;
     let mut current = 0;
-    
+
     while current < rows {
         let mut buf = String::new();
         for i in 0..batch_size {
             if current + i >= rows {
                 break;
             }
-            
+
             let org_id = (current + i) % 100;
             let repo_id = (current + i) % 10_000;
             let user_id = current + i;
-            
+
             // Add to org
-            buf.push_str(&format!("{},organization,org_{},member,user,user_{},\n", tenant_id, org_id, user_id));
-            
+            buf.push_str(&format!(
+                "{},organization,org_{},member,user,user_{},\n",
+                tenant_id, org_id, user_id
+            ));
+
             // Add repo to org (only once per repo to avoid unique constraint violations)
             if (current + i) < 10_000 {
-                buf.push_str(&format!("{},repo,repo_{},organization,organization,org_{},\n", tenant_id, repo_id, org_id));
+                buf.push_str(&format!(
+                    "{},repo,repo_{},organization,organization,org_{},\n",
+                    tenant_id, repo_id, org_id
+                ));
             }
 
             // Direct read access to repo
-            buf.push_str(&format!("{},repo,repo_{},reader,user,user_{},\n", tenant_id, repo_id, user_id));
+            buf.push_str(&format!(
+                "{},repo,repo_{},reader,user,user_{},\n",
+                tenant_id, repo_id, user_id
+            ));
         }
-        
+
         copy_in.send(buf.as_bytes()).await?;
         current += batch_size;
         println!("  Copied {} rows...", current);
     }
-    
+
     copy_in.finish().await?;
     tx.commit().await?;
 
@@ -129,10 +136,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. Concurrent Load Testing
     println!("Running concurrent load queries...");
-    
+
     let concurrency = 100;
     let requests_per_worker = 100;
-    
+
     let mut join_set = JoinSet::new();
     let start_queries = Instant::now();
 
@@ -143,10 +150,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             for req in 0..requests_per_worker {
                 let user_id = format!("user_{}", (worker_id * 1000) + req);
                 let repo_id = format!("repo_{}", req % 100);
-                
-                let user = Subject::Entity(Object { namespace: "user".into(), id: user_id });
-                let repo = Object { namespace: "repo".into(), id: repo_id };
-                
+
+                let user = Subject::Entity(Object {
+                    namespace: "user".into(),
+                    id: user_id,
+                });
+                let repo = Object {
+                    namespace: "repo".into(),
+                    id: repo_id,
+                };
+
                 let start = Instant::now();
                 let _ = engine.check(tenant_id, &user, "reader", &repo).await;
                 latencies.push(start.elapsed().as_micros());
@@ -164,16 +177,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let query_duration = start_queries.elapsed();
     all_latencies.sort_unstable();
-    
+
     let p50 = all_latencies[all_latencies.len() / 2];
     let p90 = all_latencies[(all_latencies.len() as f64 * 0.90) as usize];
     let p99 = all_latencies[(all_latencies.len() as f64 * 0.99) as usize];
-    
-    println!("Finished {} requests in {:.2?}", concurrency * requests_per_worker, query_duration);
-    println!("Latencies (us): P50: {}us | P90: {}us | P99: {}us", p50, p90, p99);
+
+    println!(
+        "Finished {} requests in {:.2?}",
+        concurrency * requests_per_worker,
+        query_duration
+    );
+    println!(
+        "Latencies (us): P50: {}us | P90: {}us | P99: {}us",
+        p50, p90, p99
+    );
 
     println!("Cleaning up test data...");
-    sqlx::query("DELETE FROM zanzibar_tuple WHERE tenant_id = $1").bind(tenant_id).execute(&pool).await?;
+    sqlx::query("DELETE FROM zanzibar_tuple WHERE tenant_id = $1")
+        .bind(tenant_id)
+        .execute(&pool)
+        .await?;
 
     Ok(())
 }

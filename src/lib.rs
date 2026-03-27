@@ -24,7 +24,7 @@ impl std::fmt::Display for Object {
 pub enum Subject {
     /// A specific entity (e.g., namespace: "user", id: "alice")
     Entity(Object),
-    /// A dynamic set of users (e.g., namespace: "project", id: "123", relation: "member")
+    /// A dynamic set of users (e.g., namespace: "workspace", id: "123", relation: "member")
     Userset { object: Object, relation: String },
 }
 

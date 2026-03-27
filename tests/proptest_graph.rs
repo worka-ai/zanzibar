@@ -1,9 +1,11 @@
 use proptest::prelude::*;
 use sqlx::PgPool;
-use zanzibar::postgres::PostgresRebacEngine;
-use zanzibar::{NamespaceConfig, Object, RebacEngine, RelationRule, SchemaBuilder, Subject, Tuple, TupleUpdate};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicI64, Ordering};
+use zanzibar::postgres::PostgresRebacEngine;
+use zanzibar::{
+    NamespaceConfig, Object, RebacEngine, RelationRule, SchemaBuilder, Subject, Tuple, TupleUpdate,
+};
 
 static TENANT_COUNTER: AtomicI64 = AtomicI64::new(0);
 static INIT_ONCE: std::sync::Once = std::sync::Once::new();
@@ -28,32 +30,44 @@ fn next_tenant_id() -> i64 {
 
 #[derive(Debug, Clone)]
 enum GeneratedTuple {
-    Direct { obj: String, subject: String },         // doc -> user
-    Userset { obj: String, group: String },          // doc -> group#member
-    GroupMember { group: String, subject: String },  // group -> user
+    Direct { obj: String, subject: String },        // doc -> user
+    Userset { obj: String, group: String },         // doc -> group#member
+    GroupMember { group: String, subject: String }, // group -> user
     GroupInclude { group: String, nested_group: String }, // group -> group#member
 }
 
-fn graph_strategy(num_docs: usize, num_groups: usize, num_users: usize) -> impl Strategy<Value = Vec<GeneratedTuple>> {
+fn graph_strategy(
+    num_docs: usize,
+    num_groups: usize,
+    num_users: usize,
+) -> impl Strategy<Value = Vec<GeneratedTuple>> {
     let max_edges = num_docs * num_users + num_groups * num_users + num_groups * num_groups;
-    
+
     proptest::collection::vec(
         prop_oneof![
-            (0..num_docs, 0..num_users).prop_map(|(d, u)| GeneratedTuple::Direct { obj: format!("doc_{}", d), subject: format!("user_{}", u) }),
-            (0..num_docs, 0..num_groups).prop_map(|(d, g)| GeneratedTuple::Userset { obj: format!("doc_{}", d), group: format!("group_{}", g) }),
-            (0..num_groups, 0..num_users).prop_map(|(g, u)| GeneratedTuple::GroupMember { group: format!("group_{}", g), subject: format!("user_{}", u) }),
-            (0..num_groups, 0..num_groups).prop_map(|(g1, g2)| GeneratedTuple::GroupInclude { group: format!("group_{}", g1), nested_group: format!("group_{}", g2) }),
+            (0..num_docs, 0..num_users).prop_map(|(d, u)| GeneratedTuple::Direct {
+                obj: format!("doc_{}", d),
+                subject: format!("user_{}", u)
+            }),
+            (0..num_docs, 0..num_groups).prop_map(|(d, g)| GeneratedTuple::Userset {
+                obj: format!("doc_{}", d),
+                group: format!("group_{}", g)
+            }),
+            (0..num_groups, 0..num_users).prop_map(|(g, u)| GeneratedTuple::GroupMember {
+                group: format!("group_{}", g),
+                subject: format!("user_{}", u)
+            }),
+            (0..num_groups, 0..num_groups).prop_map(|(g1, g2)| GeneratedTuple::GroupInclude {
+                group: format!("group_{}", g1),
+                nested_group: format!("group_{}", g2)
+            }),
         ],
-        0..max_edges.min(50) // generate up to 50 random edges
+        0..max_edges.min(50), // generate up to 50 random edges
     )
 }
 
 // A pure Rust Oracle that computes reachability using BFS to guarantee termination on cycles
-fn check_oracle(
-    tuples: &[GeneratedTuple],
-    doc_id: &str,
-    user_id: &str,
-) -> bool {
+fn check_oracle(tuples: &[GeneratedTuple], doc_id: &str, user_id: &str) -> bool {
     let mut direct_viewers: HashSet<String> = HashSet::new();
     let mut group_viewers: HashSet<String> = HashSet::new(); // groups that have access to doc
     let mut group_members: HashMap<String, HashSet<String>> = HashMap::new(); // group -> direct users
@@ -68,10 +82,19 @@ fn check_oracle(
                 group_viewers.insert(group.clone());
             }
             GeneratedTuple::GroupMember { group, subject } => {
-                group_members.entry(group.clone()).or_default().insert(subject.clone());
+                group_members
+                    .entry(group.clone())
+                    .or_default()
+                    .insert(subject.clone());
             }
-            GeneratedTuple::GroupInclude { group, nested_group } => {
-                nested_groups.entry(group.clone()).or_default().insert(nested_group.clone());
+            GeneratedTuple::GroupInclude {
+                group,
+                nested_group,
+            } => {
+                nested_groups
+                    .entry(group.clone())
+                    .or_default()
+                    .insert(nested_group.clone());
             }
             _ => {}
         }
@@ -85,7 +108,9 @@ fn check_oracle(
     let mut visited: HashSet<String> = HashSet::new();
 
     while let Some(g) = queue.pop_front() {
-        if visited.contains(&g) { continue; }
+        if visited.contains(&g) {
+            continue;
+        }
         visited.insert(g.clone());
 
         // Check direct members
@@ -116,7 +141,7 @@ proptest! {
             let engine = PostgresRebacEngine::new(pool);
             let tenant_id = next_tenant_id();
 
-            // Schema: 
+            // Schema:
             // - Doc can have viewers (inherits from owner, but we'll just test viewers)
             // - Group can have members (Users or other Groups)
             // - Doc viewer can be a Group#member
@@ -146,9 +171,9 @@ proptest! {
                     GeneratedTuple::Userset { obj, group } => TupleUpdate::Write(Tuple {
                         object: Object { namespace: "doc".into(), id: obj.clone() },
                         relation: "viewer".into(),
-                        subject: Subject::Userset { 
+                        subject: Subject::Userset {
                             object: Object { namespace: "group".into(), id: group.clone() },
-                            relation: "member".into() 
+                            relation: "member".into()
                         },
                     }),
                     GeneratedTuple::GroupMember { group, subject } => TupleUpdate::Write(Tuple {
@@ -185,9 +210,9 @@ proptest! {
                     let engine_answer = engine.check(tenant_id, &user_sub, "viewer", &doc_obj).await.unwrap();
 
                     assert_eq!(
-                        oracle_answer, 
-                        engine_answer, 
-                        "Mismatch for doc {} user {}\nGraph: {:#?}", 
+                        oracle_answer,
+                        engine_answer,
+                        "Mismatch for doc {} user {}\nGraph: {:#?}",
                         doc_id, user_id, tuples
                     );
                 }

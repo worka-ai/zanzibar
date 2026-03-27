@@ -1,21 +1,21 @@
 //! Zanzibar Benchmark Suite
-//! 
-//! This suite uses `criterion` to measure the statistical performance of the 
+//!
+//! This suite uses `criterion` to measure the statistical performance of the
 //! `zanzibar` authorization engine backed by PostgreSQL.
 //!
 //! # How it Works
-//! `criterion` runs the functions repeatedly to gather statistically significant 
-//! samples of execution time. It stores the results in `target/criterion/` 
-//! and compares the current run against the previous run to detect performance 
+//! `criterion` runs the functions repeatedly to gather statistically significant
+//! samples of execution time. It stores the results in `target/criterion/`
+//! and compares the current run against the previous run to detect performance
 //! regressions or improvements.
 //!
 //! # Scenarios
-//! 1. `deep_hierarchy_50`: Measures recursive CTE performance by checking access 
+//! 1. `deep_hierarchy_50`: Measures recursive CTE performance by checking access
 //!    to a folder nested 50 levels deep.
-//! 2. `wide_hierarchy_hit`: Measures join performance by checking access to a 
+//! 2. `wide_hierarchy_hit`: Measures join performance by checking access to a
 //!    document with 1,000 direct viewers, where the user *does* have access.
-//! 3. `wide_hierarchy_miss`: The worst-case scenario. Checks access for a user 
-//!    who does *not* have access to a document with 1,000 direct viewers, 
+//! 3. `wide_hierarchy_miss`: The worst-case scenario. Checks access for a user
+//!    who does *not* have access to a document with 1,000 direct viewers,
 //!    forcing the DB to do an exhaustive search before returning false.
 //!
 //! # Output
