@@ -3,9 +3,9 @@ use sqlx::PgPool;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicI64, Ordering};
 use zanzibar::postgres::PostgresRebacEngine;
-use zanzibar::{
-    NamespaceConfig, Object, RebacEngine, RelationRule, SchemaBuilder, Subject, Tuple, TupleUpdate,
-};
+use zanzibar::{NamespaceConfig, Object, RebacEngine, SchemaBuilder, Subject, Tuple, TupleUpdate};
+
+mod common;
 
 static TENANT_COUNTER: AtomicI64 = AtomicI64::new(0);
 static INIT_ONCE: std::sync::Once = std::sync::Once::new();
@@ -19,9 +19,11 @@ async fn setup_db() -> PgPool {
         TENANT_COUNTER.store((now % 1_000_000_000_000) as i64, Ordering::SeqCst);
     });
 
-    PgPool::connect("postgresql://worka:worka@localhost:5432/worka")
+    let pool = PgPool::connect("postgresql://worka:worka@localhost:5432/worka")
         .await
-        .expect("Failed to connect to db")
+        .expect("Failed to connect to db");
+    common::ensure_schema(&pool).await;
+    pool
 }
 
 fn next_tenant_id() -> i64 {

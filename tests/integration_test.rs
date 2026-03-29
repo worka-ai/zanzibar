@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use zanzibar::postgres::PostgresRebacEngine;
 use zanzibar::{Object, RebacEngine, Subject, Tuple, TupleUpdate};
 
+mod common;
+
 static TENANT_COUNTER: AtomicI64 = AtomicI64::new(0);
 static INIT_ONCE: std::sync::Once = std::sync::Once::new();
 
@@ -16,9 +18,15 @@ async fn setup_db() -> PgPool {
         TENANT_COUNTER.store((now % 1_000_000_000_000) as i64, Ordering::SeqCst);
     });
 
-    PgPool::connect("postgresql://worka:worka@localhost:5432/worka")
+    let database_url = std::env::var("WORKA_CLOUD_DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql://worka:worka@localhost:5432/worka".to_string());
+    let pool = PgPool::connect(&database_url)
         .await
-        .expect("Failed to connect to db")
+        .expect("Failed to connect to db");
+
+    common::ensure_schema(&pool).await;
+
+    pool
 }
 
 fn next_tenant_id() -> i64 {
