@@ -44,15 +44,13 @@ impl RebacEngine for PostgresRebacEngine {
                 SELECT 
                     $2::TEXT AS namespace, 
                     $3::TEXT AS object_id, 
-                    $4::TEXT AS relation, 
-                    1 AS depth
+                    $4::TEXT AS relation
 
                 UNION
 
                 -- 2. Recursive Case: Expand through schema and tuples
                 SELECT 
-                    next_node.namespace, next_node.object_id, next_node.relation,
-                    ru.depth + 1
+                    next_node.namespace, next_node.object_id, next_node.relation
                 FROM reachable_usersets ru
                 CROSS JOIN LATERAL (
                     -- A. Same-object Inheritance (Rewrites)
@@ -92,7 +90,6 @@ impl RebacEngine for PostgresRebacEngine {
                         AND rc.inherited_from_target_relation IS NOT NULL
                         AND rc.inherited_relation IS NOT NULL
                 ) next_node
-                WHERE ru.depth < 100
             )
             SELECT EXISTS (
                 -- terminal check: any reachable userset points directly to the subject
@@ -361,8 +358,7 @@ impl RebacEngine for PostgresRebacEngine {
                 SELECT 
                     t.object_namespace, 
                     t.object_id, 
-                    t.relation, 
-                    1 AS depth
+                    t.relation
                 FROM zanzibar_tuple t
                 WHERE t.tenant_id = $1
                   AND (t.subject_namespace = $4 OR t.subject_namespace = '*')
@@ -373,8 +369,7 @@ impl RebacEngine for PostgresRebacEngine {
 
                 -- 2. Recursive Case: Nodes that point to previously found nodes
                 SELECT 
-                    parent.object_namespace, parent.object_id, parent.relation,
-                    child.depth + 1
+                    parent.object_namespace, parent.object_id, parent.relation
                 FROM nodes_reaching_subject child
                 CROSS JOIN LATERAL (
                     -- A. Tuple Traversal: Object points to Child Node as its subject
@@ -402,7 +397,6 @@ impl RebacEngine for PostgresRebacEngine {
                             (rc.inherited_from_target_relation = child.relation AND rc.inherited_relation IS NOT NULL)
                         )
                 ) parent
-                WHERE child.depth < 10
             )
             SELECT DISTINCT object_id 
             FROM nodes_reaching_subject 
@@ -432,17 +426,17 @@ impl RebacEngine for PostgresRebacEngine {
     ) -> Result<Vec<String>, RebacError> {
         let query = r#"
             WITH RECURSIVE expanded_subjects AS (
-                SELECT subject_namespace, subject_id, subject_relation, 1 as depth
+                SELECT subject_namespace, subject_id, subject_relation
                 FROM zanzibar_tuple
                 WHERE tenant_id = $1 AND object_namespace = $2 AND object_id = $3 AND relation = $4
                 UNION
-                SELECT t.subject_namespace, t.subject_id, t.subject_relation, es.depth + 1
+                SELECT t.subject_namespace, t.subject_id, t.subject_relation
                 FROM expanded_subjects es
                 JOIN zanzibar_tuple t ON t.tenant_id = $1 
                     AND t.object_namespace = es.subject_namespace 
                     AND t.object_id = es.subject_id 
                     AND t.relation = es.subject_relation
-                WHERE es.subject_relation IS NOT NULL AND es.depth < 10
+                WHERE es.subject_relation IS NOT NULL
             )
             SELECT DISTINCT subject_id FROM expanded_subjects 
             WHERE (subject_namespace = $5 OR subject_namespace = '*') AND subject_relation IS NULL
