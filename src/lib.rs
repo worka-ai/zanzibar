@@ -1,3 +1,5 @@
+#[cfg(feature = "anvil")]
+pub mod anvil;
 pub mod postgres;
 
 pub const POSTGRES_SCHEMA: &str = include_str!("../schema.sql");

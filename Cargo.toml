@@ -13,6 +13,7 @@ homepage = "https://github.com/worka-ai/zanzibar"
 repository = "https://github.com/worka-ai/zanzibar"
 
 [dependencies]
+anvil-storage = { path = "../anvil/clients/rust", optional = true }
 anyhow = "1.0"
 async-trait = "0.1.89"
 moka = { version = "0.12.14", features = ["future"] }
@@ -22,6 +23,9 @@ sqlx = { version = "0.7.4", features = ["postgres", "runtime-tokio-rustls", "jso
 thiserror = "1.0"
 tokio = { version = "1.49.0", features = ["full"] }
 tracing = "0.1"
+
+[features]
+anvil = ["dep:anvil-storage"]
 
 [dev-dependencies]
 proptest = "1.6.0"
