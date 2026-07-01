@@ -133,6 +133,12 @@ impl SchemaBuilder {
     }
 }
 
+impl Default for SchemaBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RebacError {
     #[error("Database error: {0}")]
