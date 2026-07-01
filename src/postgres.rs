@@ -5,7 +5,6 @@ use crate::{
 use anyhow::Result;
 use async_trait::async_trait;
 use sqlx::{PgPool, Row};
-use tracing::{debug, error};
 
 #[derive(Clone)]
 pub struct PostgresRebacEngine {
