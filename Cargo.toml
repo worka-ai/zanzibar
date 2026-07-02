@@ -1,6 +1,6 @@
 [package]
 name = "zanzibar"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.85"
@@ -14,7 +14,7 @@ repository = "https://github.com/worka-ai/zanzibar"
 
 [dependencies]
 anyhow = "1.0"
-anvil-storage = { git = "https://github.com/worka-ai/anvil.git", branch = "main", optional = true }
+anvil-storage = { version = "0.2.0", path = "../../../anvil/clients/rust", optional = true }
 async-trait = "0.1.89"
 moka = { version = "0.12.14", features = ["future"] }
 serde = { version = "1.0", features = ["derive"] }

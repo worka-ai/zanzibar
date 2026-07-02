@@ -4,7 +4,10 @@ use std::env;
 use std::time::Instant;
 use tokio::task::JoinSet;
 use zanzibar::postgres::PostgresRebacEngine;
-use zanzibar::{NamespaceConfig, Object, RebacEngine, RelationRule, SchemaBuilder, Subject};
+use zanzibar::{
+    AuthzScope, NamespaceConfig, Object, RebacEngine, RelationRule, SchemaBuilder, SchemaId,
+    Subject, put_and_bind_schema,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -33,8 +36,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Target rows: {}", rows);
 
     let pool = PgPool::connect(&database_url).await?;
+    sqlx::query(zanzibar::POSTGRES_SCHEMA)
+        .execute(&pool)
+        .await?;
     let engine = PostgresRebacEngine::new(pool.clone());
-    let tenant_id = 888888; // Dedicated tenant for enterprise stress test
+    let scope = AuthzScope::new("stress-test", "enterprise");
 
     // 1. Setup Enterprise Schema (GitHub style)
     let schema = SchemaBuilder::new()
@@ -57,6 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             target_relation: "admin".to_string(),
                         }],
                     ),
+                    ("organization".to_string(), vec![]),
                 ]),
             },
         )
@@ -71,13 +78,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .build();
 
-    engine.apply_schema(tenant_id, schema).await?;
+    put_and_bind_schema(
+        &engine,
+        &scope,
+        SchemaId("stress".to_string()),
+        schema,
+        None,
+    )
+    .await?;
 
     // 2. Clear old data
-    sqlx::query("DELETE FROM zanzibar_tuple WHERE tenant_id = $1")
-        .bind(tenant_id)
-        .execute(&pool)
-        .await?;
+    sqlx::query(
+        "DELETE FROM zanzibar_scoped_tuple WHERE storage_tenant_id = $1 AND authz_realm_id = $2",
+    )
+    .bind(&scope.anvil_storage_tenant_id.0)
+    .bind(&scope.authz_realm_id.0)
+    .execute(&pool)
+    .await?;
 
     // 3. Fast Bulk Generation via COPY
     println!("Generating and writing {} rows via COPY CSV...", rows);
@@ -85,7 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut tx = pool.begin().await?;
     let mut copy_in = tx.copy_in_raw(
-        "COPY zanzibar_tuple (tenant_id, object_namespace, object_id, relation, subject_namespace, subject_id, subject_relation) FROM STDIN WITH (FORMAT csv)"
+        "COPY zanzibar_scoped_tuple (storage_tenant_id, authz_realm_id, object_namespace, object_id, relation, subject_namespace, subject_id, subject_relation) FROM STDIN WITH (FORMAT csv)"
     ).await?;
 
     let batch_size = 100_000;
@@ -104,22 +121,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Add to org
             buf.push_str(&format!(
-                "{},organization,org_{},member,user,user_{},\n",
-                tenant_id, org_id, user_id
+                "{},{},organization,org_{},member,user,user_{},\n",
+                scope.anvil_storage_tenant_id.0, scope.authz_realm_id.0, org_id, user_id
             ));
 
             // Add repo to org (only once per repo to avoid unique constraint violations)
             if (current + i) < 10_000 {
                 buf.push_str(&format!(
-                    "{},repo,repo_{},organization,organization,org_{},\n",
-                    tenant_id, repo_id, org_id
+                    "{},{},repo,repo_{},organization,organization,org_{},\n",
+                    scope.anvil_storage_tenant_id.0, scope.authz_realm_id.0, repo_id, org_id
                 ));
             }
 
             // Direct read access to repo
             buf.push_str(&format!(
-                "{},repo,repo_{},reader,user,user_{},\n",
-                tenant_id, repo_id, user_id
+                "{},{},repo,repo_{},reader,user,user_{},\n",
+                scope.anvil_storage_tenant_id.0, scope.authz_realm_id.0, repo_id, user_id
             ));
         }
 
@@ -145,6 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for worker_id in 0..concurrency {
         let engine = engine.clone();
+        let scope = scope.clone();
         join_set.spawn(async move {
             let mut latencies = Vec::with_capacity(requests_per_worker);
             for req in 0..requests_per_worker {
@@ -161,7 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 let start = Instant::now();
-                let _ = engine.check(tenant_id, &user, "reader", &repo).await;
+                let _ = engine.check(&scope, &user, "reader", &repo).await;
                 latencies.push(start.elapsed().as_micros());
             }
             latencies
@@ -193,10 +211,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     println!("Cleaning up test data...");
-    sqlx::query("DELETE FROM zanzibar_tuple WHERE tenant_id = $1")
-        .bind(tenant_id)
-        .execute(&pool)
-        .await?;
+    sqlx::query(
+        "DELETE FROM zanzibar_scoped_tuple WHERE storage_tenant_id = $1 AND authz_realm_id = $2",
+    )
+    .bind(&scope.anvil_storage_tenant_id.0)
+    .bind(&scope.authz_realm_id.0)
+    .execute(&pool)
+    .await?;
 
     Ok(())
 }

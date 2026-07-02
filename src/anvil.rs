@@ -1,6 +1,8 @@
 use crate::{
-    CheckRequest, NamespaceConfig, Object, RebacEngine, RebacError, RelationRule, Schema, Subject,
-    Tuple, TupleUpdate,
+    AnvilStorageTenantId, AuthzDecisionMetadata, AuthzScope, AuthzWriteResult, BindingGeneration,
+    CheckDecision, CheckRequest, ListObjectsResult, ListSubjectsResult, NamespaceConfig, Object,
+    RebacEngine, RebacError, RelationRule, Schema, SchemaBinding, SchemaId, SchemaRef,
+    SchemaRevision, Subject, Tuple, TupleUpdate,
 };
 use anvil_storage::{AnvilClient, proto};
 use async_trait::async_trait;
@@ -36,7 +38,7 @@ impl AnvilConsistency {
 #[derive(Clone)]
 pub struct AnvilRebacEngine {
     client: AnvilClient,
-    schemas: Arc<RwLock<HashMap<i64, Schema>>>,
+    schemas: Arc<RwLock<HashMap<(String, String, u64), Schema>>>,
 }
 
 impl AnvilRebacEngine {
@@ -49,6 +51,7 @@ impl AnvilRebacEngine {
 
     pub async fn write_tuples_with_zookie(
         &self,
+        scope: &AuthzScope,
         updates: Vec<TupleUpdate>,
     ) -> Result<Option<AnvilConsistencyToken>, RebacError> {
         if updates.is_empty() {
@@ -61,7 +64,10 @@ impl AnvilRebacEngine {
         let response = self
             .client
             .auth()
-            .write_authz_tuples(proto::WriteAuthzTuplesRequest { mutations })
+            .write_authz_tuples(proto::WriteAuthzTuplesRequest {
+                mutations,
+                scope: Some(scope_to_proto(scope)),
+            })
             .await
             .map_err(anvil_status)?
             .into_inner();
@@ -73,6 +79,7 @@ impl AnvilRebacEngine {
 
     pub async fn read_tuples_with_consistency(
         &self,
+        scope: &AuthzScope,
         object: Option<Object>,
         relation: Option<String>,
         subject: Option<Subject>,
@@ -108,6 +115,7 @@ impl AnvilRebacEngine {
                     zookie: zookie.clone(),
                     page_size: 1000,
                     page_token,
+                    scope: Some(scope_to_proto(scope)),
                 })
                 .await
                 .map_err(anvil_status)?
@@ -129,15 +137,18 @@ impl AnvilRebacEngine {
 
     pub async fn check_with_consistency(
         &self,
-        tenant_id: i64,
+        scope: &AuthzScope,
         subject: &Subject,
         relation: &str,
         object: &Object,
         consistency: AnvilConsistency,
     ) -> Result<(bool, AnvilConsistencyToken), RebacError> {
-        let schema = self.schema_for_tenant(tenant_id).await?;
+        let binding = self.get_schema_binding(scope).await?;
+        let schema = self
+            .schema_for_ref(&scope.anvil_storage_tenant_id, &binding.schema_ref)
+            .await?;
         let (tuples, token) = self
-            .read_tuples_with_consistency(None, None, None, consistency)
+            .read_tuples_with_consistency(scope, None, None, None, consistency)
             .await?;
         let view = TupleView::new(tuples);
         Ok((view.check(&schema, object, relation, subject), token))
@@ -145,6 +156,7 @@ impl AnvilRebacEngine {
 
     pub async fn watch_tuple_log(
         &self,
+        scope: &AuthzScope,
         after_revision: u64,
         namespace: impl Into<String>,
     ) -> Result<Streaming<proto::WatchAuthzTupleLogResponse>, RebacError> {
@@ -153,6 +165,7 @@ impl AnvilRebacEngine {
             .watch_authz_tuple_log(proto::WatchAuthzTupleLogRequest {
                 after_revision,
                 namespace: namespace.into(),
+                scope: Some(scope_to_proto(scope)),
             })
             .await
             .map(|response| response.into_inner())
@@ -162,111 +175,280 @@ impl AnvilRebacEngine {
 
 #[async_trait]
 impl RebacEngine for AnvilRebacEngine {
-    async fn apply_schema(&self, tenant_id: i64, schema: Schema) -> Result<(), RebacError> {
+    async fn put_schema(
+        &self,
+        storage_tenant: &AnvilStorageTenantId,
+        schema_id: SchemaId,
+        schema: Schema,
+    ) -> Result<SchemaRef, RebacError> {
         validate_schema(&schema)?;
         let namespaces = schema_to_proto_namespaces(&schema)?;
-        self.client
+        let response = self
+            .client
             .auth()
-            .apply_authz_schema(proto::ApplyAuthzSchemaRequest {
+            .put_authz_schema(proto::PutAuthzSchemaRequest {
+                anvil_storage_tenant_id: storage_tenant.0.clone(),
+                schema_id: schema_id.0.clone(),
                 namespaces,
-                reason: "zanzibar schema apply".to_string(),
+                reason: "zanzibar schema put".to_string(),
             })
             .await
-            .map_err(anvil_status)?;
-        self.schemas.write().await.insert(tenant_id, schema);
-        Ok(())
+            .map_err(anvil_status)?
+            .into_inner();
+        let schema_ref = response
+            .schema_ref
+            .map(schema_ref_from_proto)
+            .ok_or_else(|| RebacError::Internal("Anvil schema response missing ref".to_string()))?;
+        self.schemas.write().await.insert(
+            (
+                storage_tenant.0.clone(),
+                schema_ref.schema_id.0.clone(),
+                schema_ref.schema_revision.0,
+            ),
+            schema,
+        );
+        Ok(schema_ref)
+    }
+
+    async fn get_schema(
+        &self,
+        storage_tenant: &AnvilStorageTenantId,
+        schema_id: &SchemaId,
+        revision: Option<SchemaRevision>,
+    ) -> Result<(SchemaRef, Schema), RebacError> {
+        let response = self
+            .client
+            .auth()
+            .get_authz_schema(proto::GetAuthzSchemaRequest {
+                namespace: String::new(),
+                anvil_storage_tenant_id: storage_tenant.0.clone(),
+                schema_id: schema_id.0.clone(),
+                schema_revision: revision.map(|revision| revision.0),
+            })
+            .await
+            .map_err(anvil_status)?
+            .into_inner();
+        let schema_ref = response
+            .schema_ref
+            .map(schema_ref_from_proto)
+            .ok_or_else(|| RebacError::SchemaNotFound(schema_id.0.clone()))?;
+        let schema = schema_from_proto_namespaces(response.namespaces)?;
+        self.schemas.write().await.insert(
+            (
+                storage_tenant.0.clone(),
+                schema_ref.schema_id.0.clone(),
+                schema_ref.schema_revision.0,
+            ),
+            schema.clone(),
+        );
+        Ok((schema_ref, schema))
+    }
+
+    async fn bind_schema(
+        &self,
+        scope: &AuthzScope,
+        schema_ref: SchemaRef,
+        expected_generation: Option<BindingGeneration>,
+    ) -> Result<SchemaBinding, RebacError> {
+        let response = self
+            .client
+            .auth()
+            .bind_authz_schema(proto::BindAuthzSchemaRequest {
+                scope: Some(scope_to_proto(scope)),
+                schema_ref: Some(schema_ref_to_proto(&schema_ref)),
+                expected_binding_generation: expected_generation.map(|generation| generation.0),
+                reason: "zanzibar schema bind".to_string(),
+            })
+            .await
+            .map_err(anvil_status)?
+            .into_inner();
+        let response_ref = response
+            .schema_ref
+            .map(schema_ref_from_proto)
+            .ok_or_else(|| {
+                RebacError::Internal("Anvil binding response missing ref".to_string())
+            })?;
+        Ok(SchemaBinding {
+            scope: scope.clone(),
+            schema_ref: response_ref,
+            binding_generation: BindingGeneration(response.binding_generation),
+        })
+    }
+
+    async fn get_schema_binding(&self, scope: &AuthzScope) -> Result<SchemaBinding, RebacError> {
+        let response = self
+            .client
+            .auth()
+            .get_authz_schema_binding(proto::GetAuthzSchemaBindingRequest {
+                scope: Some(scope_to_proto(scope)),
+            })
+            .await
+            .map_err(anvil_status)?
+            .into_inner();
+        let schema_ref = response
+            .schema_ref
+            .map(schema_ref_from_proto)
+            .ok_or_else(|| RebacError::SchemaBindingNotFound(scope.clone()))?;
+        Ok(SchemaBinding {
+            scope: scope.clone(),
+            schema_ref,
+            binding_generation: BindingGeneration(response.binding_generation),
+        })
     }
 
     async fn write_tuples(
         &self,
-        _tenant_id: i64,
+        scope: &AuthzScope,
         updates: Vec<TupleUpdate>,
-    ) -> Result<(), RebacError> {
-        self.write_tuples_with_zookie(updates).await?;
-        Ok(())
+    ) -> Result<AuthzWriteResult, RebacError> {
+        let binding = self.get_schema_binding(scope).await?;
+        let token = self
+            .write_tuples_with_zookie(scope, updates)
+            .await?
+            .unwrap_or(AnvilConsistencyToken {
+                revision: 0,
+                zookie: String::new(),
+            });
+        Ok(AuthzWriteResult {
+            metadata: AuthzDecisionMetadata {
+                scope: scope.clone(),
+                schema_ref: binding.schema_ref,
+                authz_revision: token.revision,
+                zookie: token.zookie,
+            },
+        })
     }
 
     async fn read_tuples(
         &self,
-        _tenant_id: i64,
+        scope: &AuthzScope,
         object: Option<Object>,
         relation: Option<String>,
         subject: Option<Subject>,
     ) -> Result<Vec<Tuple>, RebacError> {
-        self.read_tuples_with_consistency(object, relation, subject, AnvilConsistency::Latest)
-            .await
-            .map(|(tuples, _)| tuples)
+        self.read_tuples_with_consistency(
+            scope,
+            object,
+            relation,
+            subject,
+            AnvilConsistency::Latest,
+        )
+        .await
+        .map(|(tuples, _)| tuples)
     }
 
     async fn check(
         &self,
-        tenant_id: i64,
+        scope: &AuthzScope,
         subject: &Subject,
         relation: &str,
         object: &Object,
-    ) -> Result<bool, RebacError> {
-        self.check_with_consistency(
-            tenant_id,
-            subject,
-            relation,
-            object,
-            AnvilConsistency::Latest,
-        )
-        .await
-        .map(|(allowed, _)| allowed)
+    ) -> Result<CheckDecision, RebacError> {
+        let binding = self.get_schema_binding(scope).await?;
+        self.check_with_consistency(scope, subject, relation, object, AnvilConsistency::Latest)
+            .await
+            .map(|(allowed, token)| CheckDecision {
+                allowed,
+                metadata: AuthzDecisionMetadata {
+                    scope: scope.clone(),
+                    schema_ref: binding.schema_ref,
+                    authz_revision: token.revision,
+                    zookie: token.zookie,
+                },
+            })
     }
 
     async fn check_many(
         &self,
-        tenant_id: i64,
+        scope: &AuthzScope,
         requests: Vec<CheckRequest>,
-    ) -> Result<Vec<bool>, RebacError> {
-        let schema = self.schema_for_tenant(tenant_id).await?;
-        let tuples = self.read_tuples(tenant_id, None, None, None).await?;
+    ) -> Result<Vec<CheckDecision>, RebacError> {
+        let binding = self.get_schema_binding(scope).await?;
+        let schema = self
+            .schema_for_ref(&scope.anvil_storage_tenant_id, &binding.schema_ref)
+            .await?;
+        let tuples = self.read_tuples(scope, None, None, None).await?;
         let view = TupleView::new(tuples);
         Ok(requests
             .into_iter()
-            .map(|request| {
-                view.check(
+            .map(|request| CheckDecision {
+                allowed: view.check(
                     &schema,
                     &request.object,
                     &request.relation,
                     &request.subject,
-                )
+                ),
+                metadata: AuthzDecisionMetadata {
+                    scope: scope.clone(),
+                    schema_ref: binding.schema_ref.clone(),
+                    authz_revision: 0,
+                    zookie: String::new(),
+                },
             })
             .collect())
     }
 
     async fn list_objects(
         &self,
-        tenant_id: i64,
+        scope: &AuthzScope,
         subject: &Subject,
         relation: &str,
         object_namespace: &str,
-    ) -> Result<Vec<String>, RebacError> {
-        let schema = self.schema_for_tenant(tenant_id).await?;
-        let tuples = self.read_tuples(tenant_id, None, None, None).await?;
+    ) -> Result<ListObjectsResult, RebacError> {
+        let binding = self.get_schema_binding(scope).await?;
+        let schema = self
+            .schema_for_ref(&scope.anvil_storage_tenant_id, &binding.schema_ref)
+            .await?;
+        let tuples = self.read_tuples(scope, None, None, None).await?;
         let view = TupleView::new(tuples);
-        Ok(view.list_objects(&schema, subject, relation, object_namespace))
+        Ok(ListObjectsResult {
+            object_ids: view.list_objects(&schema, subject, relation, object_namespace),
+            metadata: AuthzDecisionMetadata {
+                scope: scope.clone(),
+                schema_ref: binding.schema_ref,
+                authz_revision: 0,
+                zookie: String::new(),
+            },
+        })
     }
 
     async fn list_subjects(
         &self,
-        tenant_id: i64,
+        scope: &AuthzScope,
         object: &Object,
         relation: &str,
         subject_namespace: &str,
-    ) -> Result<Vec<String>, RebacError> {
-        let schema = self.schema_for_tenant(tenant_id).await?;
-        let tuples = self.read_tuples(tenant_id, None, None, None).await?;
+    ) -> Result<ListSubjectsResult, RebacError> {
+        let binding = self.get_schema_binding(scope).await?;
+        let schema = self
+            .schema_for_ref(&scope.anvil_storage_tenant_id, &binding.schema_ref)
+            .await?;
+        let tuples = self.read_tuples(scope, None, None, None).await?;
         let view = TupleView::new(tuples);
-        Ok(view.list_subjects(&schema, object, relation, subject_namespace))
+        Ok(ListSubjectsResult {
+            subject_ids: view.list_subjects(&schema, object, relation, subject_namespace),
+            metadata: AuthzDecisionMetadata {
+                scope: scope.clone(),
+                schema_ref: binding.schema_ref,
+                authz_revision: 0,
+                zookie: String::new(),
+            },
+        })
     }
 }
 
 impl AnvilRebacEngine {
-    async fn schema_for_tenant(&self, tenant_id: i64) -> Result<Schema, RebacError> {
-        if let Some(schema) = self.schemas.read().await.get(&tenant_id).cloned() {
+    async fn schema_for_ref(
+        &self,
+        storage_tenant: &AnvilStorageTenantId,
+        schema_ref: &SchemaRef,
+    ) -> Result<Schema, RebacError> {
+        let key = (
+            storage_tenant.0.clone(),
+            schema_ref.schema_id.0.clone(),
+            schema_ref.schema_revision.0,
+        );
+        if let Some(schema) = self.schemas.read().await.get(&key).cloned() {
             return Ok(schema);
         }
         let response = self
@@ -274,13 +456,39 @@ impl AnvilRebacEngine {
             .auth()
             .get_authz_schema(proto::GetAuthzSchemaRequest {
                 namespace: String::new(),
+                anvil_storage_tenant_id: storage_tenant.0.clone(),
+                schema_id: schema_ref.schema_id.0.clone(),
+                schema_revision: Some(schema_ref.schema_revision.0),
             })
             .await
             .map_err(anvil_status)?
             .into_inner();
         let schema = schema_from_proto_namespaces(response.namespaces)?;
-        self.schemas.write().await.insert(tenant_id, schema.clone());
+        self.schemas.write().await.insert(key, schema.clone());
         Ok(schema)
+    }
+}
+
+fn scope_to_proto(scope: &AuthzScope) -> proto::AuthzScope {
+    proto::AuthzScope {
+        anvil_storage_tenant_id: scope.anvil_storage_tenant_id.0.clone(),
+        authz_realm_id: scope.authz_realm_id.0.clone(),
+    }
+}
+
+fn schema_ref_to_proto(schema_ref: &SchemaRef) -> proto::AuthzSchemaRef {
+    proto::AuthzSchemaRef {
+        schema_id: schema_ref.schema_id.0.clone(),
+        schema_revision: schema_ref.schema_revision.0,
+        schema_digest: schema_ref.schema_digest.clone(),
+    }
+}
+
+fn schema_ref_from_proto(schema_ref: proto::AuthzSchemaRef) -> SchemaRef {
+    SchemaRef {
+        schema_id: SchemaId(schema_ref.schema_id),
+        schema_revision: SchemaRevision(schema_ref.schema_revision),
+        schema_digest: schema_ref.schema_digest,
     }
 }
 
@@ -305,6 +513,7 @@ fn tuple_update_to_mutation(update: TupleUpdate) -> Result<proto::AuthzTupleMuta
         caveat_hash: String::new(),
         operation: operation.to_string(),
         reason: "zanzibar tuple update".to_string(),
+        scope: None,
     })
 }
 

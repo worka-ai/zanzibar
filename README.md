@@ -1,7 +1,7 @@
 <div align="center">
   <h1>🛡️ Zanzibar-rs</h1>
   <p>
-    <strong>A high-performance, Postgres-backed ReBAC (Relationship-Based Access Control) engine in Rust, inspired by Google's Zanzibar paper.</strong>
+    <strong>A Rust ReBAC engine inspired by Google's Zanzibar paper, with Postgres and Anvil-backed storage implementations.</strong>
   </p>
   <p>
     <a href="https://crates.io/crates/zanzibar"><img src="https://img.shields.io/crates/v/zanzibar.svg" alt="Crates.io" /></a>
@@ -12,230 +12,140 @@
 
 ---
 
-`zanzibar` is an open-source authorization library designed for building enterprise-grade, permissions-aware applications. Instead of hardcoding roles (`admin`, `user`) into your application logic, Zanzibar allows you to define flexible **relationships** between resources and subjects, and recursively resolves permissions at runtime.
+`zanzibar` is an authorization library for building relationship-based access control into Rust services. Instead of hardcoding roles into application logic, applications define relationships between subjects and objects, bind those relationships to a schema, and ask the engine to resolve access decisions.
 
-Built on `sqlx` and PostgreSQL recursive Common Table Expressions (CTEs), this engine effortlessly scales to millions of relational tuples while maintaining millisecond-level resolution times.
+The crate supports:
 
-## 🚀 Features
+- Postgres-backed tuple, schema, and realm storage.
+- Optional Anvil-backed storage via the `anvil` feature.
+- Scoped authorization realms so one storage tenant can safely contain many independent applications, customers, organizations, or systems.
+- Computed usersets, tuple-to-userset rewrites, inherited relations, batch checks, object listing, and subject listing.
+- Property tests for recursive graph correctness.
 
-- **Pure ReBAC:** Implement Google Drive, GitHub, or AWS IAM style permissions instantly.
-- **Computed & Inherited Relations:** Model complex inheritance (e.g. `Folder` viewers automatically get `Document` viewer access).
-- **Postgres Native:** Leverages highly-optimized recursive CTEs. No graph database required.
-- **Stateless & Async:** Built on `tokio` and `sqlx`. Drop it into any async Rust web framework (Axum, Actix, etc).
-- **Mathematical Correctness:** Hardened via `proptest` graph fuzzing to guarantee loop safety and transitive consistency.
-
-## 📦 Installation
-
-Add `zanzibar` to your `Cargo.toml`:
+## Installation
 
 ```toml
 [dependencies]
-zanzibar = "0.1.0"
+zanzibar = "0.2"
 sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-rustls"] }
+
+# Optional Anvil backend:
+# zanzibar = { version = "0.2", features = ["anvil"] }
 ```
 
-### Applying the Schema
-The crate exports its required Postgres tables as a string constant so you can easily include it in your application's migration runner.
+Run the Postgres migration from the exported schema string:
 
 ```rust
 use sqlx::PgPool;
 
-async fn migrate(pool: &PgPool) {
-    sqlx::query(zanzibar::POSTGRES_SCHEMA)
-        .execute(pool)
-        .await
-        .unwrap();
+async fn migrate(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query(zanzibar::POSTGRES_SCHEMA).execute(pool).await?;
+    Ok(())
 }
 ```
 
-## 🧠 Core Concepts
+## Core Model
 
-Zanzibar uses four primary concepts to determine access:
+Zanzibar uses these concepts:
 
-1.  **Object:** The resource being accessed (e.g., `document:readme.md`).
-2.  **Subject:** The entity attempting access. Can be a specific user (`user:alice`) or a group of users (`group:engineering#member`).
-3.  **Relation:** The type of connection between the Object and Subject (e.g., `viewer`, `owner`).
-4.  **Tuple:** A directed edge in the database establishing a fact: *Subject has Relation to Object*.
+1. `Object`: the resource being protected, such as `doc:roadmap`.
+2. `Subject`: the caller or userset, such as `user:alice` or `group:engineering#member`.
+3. `Relation`: the relationship being checked, such as `viewer` or `owner`.
+4. `Tuple`: a stored fact connecting an object, relation, and subject.
+5. `Schema`: the rules that explain how relations inherit or compute from other relations.
+6. `AuthzScope`: the isolation boundary for tuples and decisions.
 
----
-
-## 🛠️ Usage & Examples
-
-### 1. Simple Scenario: Direct Access
-The most basic usage is granting a user a direct relation to a specific resource.
+`AuthzScope` is deliberately not just a numeric application tenant id. It is:
 
 ```rust
-use zanzibar::{Object, Subject, Tuple, TupleUpdate, postgres::PostgresRebacEngine, RebacEngine};
-
-// 1. Initialize the engine
-let engine = PostgresRebacEngine::new(pool);
-let tenant_id = 1;
-
-let doc = Object { namespace: "doc".into(), id: "1".into() };
-let alice = Subject::Entity(Object { namespace: "user".into(), id: "alice".into() });
-
-// 2. Write the tuple: Alice is a viewer of doc:1
-engine.write_tuples(tenant_id, vec![TupleUpdate::Write(Tuple {
-    object: doc.clone(),
-    relation: "viewer".into(),
-    subject: alice.clone(),
-})]).await?;
-
-// 3. Check access
-let has_access = engine.check(tenant_id, &alice, "viewer", &doc).await?;
-assert!(has_access); // true
+AuthzScope::new("storage-tenant", "authz-realm")
 ```
 
-### 2. Intermediate Scenario: Group Memberships (Usersets)
-Instead of adding every user to a document, add a group to the document, and add users to the group.
+The storage tenant identifies the durable backend container. The authz realm identifies the isolated ReBAC universe inside that container. Every tuple write, read, check, list, and watch operation is scoped by `AuthzScope`.
+
+## Basic Usage
 
 ```rust
-let engineering_group = Object { namespace: "group".into(), id: "eng".into() };
-
-// The Engineering group's members are viewers of doc:1
-engine.write_tuples(tenant_id, vec![TupleUpdate::Write(Tuple {
-    object: doc.clone(),
-    relation: "viewer".into(),
-    subject: Subject::Userset { 
-        object: engineering_group.clone(), 
-        relation: "member".into() 
-    },
-})]).await?;
-
-// Alice is a member of the Engineering group
-engine.write_tuples(tenant_id, vec![TupleUpdate::Write(Tuple {
-    object: engineering_group,
-    relation: "member".into(),
-    subject: alice.clone(),
-})]).await?;
-
-// Alice is now transitively a viewer of doc:1
-let has_access = engine.check(tenant_id, &alice, "viewer", &doc).await?;
-assert!(has_access); // true
-```
-
----
-
-### 3. Advanced Scenario: Google Drive (Recommended Typed API)
-
-When building large systems, constructing `Object` and `Subject` structs manually using raw strings is error-prone. **We strongly recommend wrapping the `zanzibar` engine in a strictly typed, domain-specific API.**
-
-Here is how you would implement a Google Drive clone where Documents inherit permissions from their parent Folders, using a strictly typed wrapper.
-
-#### Step 1: Define the Schema
-First, register the relational algebra with the engine so it knows how relationships cascade.
-
-```rust
-use zanzibar::{SchemaBuilder, NamespaceConfig, RelationRule};
 use std::collections::HashMap;
+use zanzibar::{
+    AuthzScope, NamespaceConfig, Object, RebacEngine, RelationRule, SchemaBuilder,
+    SchemaId, Subject, Tuple, TupleUpdate, put_and_bind_schema,
+};
+use zanzibar::postgres::PostgresRebacEngine;
+
+let engine = PostgresRebacEngine::new(pool);
+let scope = AuthzScope::new("prod", "customer-acme");
 
 let schema = SchemaBuilder::new()
-    .namespace("folder", NamespaceConfig {
-        rules: HashMap::from([
-            // Folder viewers inherit from parent folder viewers
-            ("viewer".to_string(), vec![
-                RelationRule::Computed {
-                    tuple_relation: "parent".to_string(),
-                    target_relation: "viewer".to_string(),
-                }
-            ]),
-        ]),
-    })
     .namespace("doc", NamespaceConfig {
         rules: HashMap::from([
-            // Doc viewers inherit from parent folder viewers
-            ("viewer".to_string(), vec![
-                RelationRule::Computed {
-                    tuple_relation: "parent".to_string(),
-                    target_relation: "viewer".to_string(),
-                }
-            ]),
+            ("viewer".to_string(), vec![RelationRule::Inherit("editor".to_string())]),
+            ("editor".to_string(), vec![]),
         ]),
     })
     .build();
 
-engine.apply_schema(tenant_id, schema).await?;
+put_and_bind_schema(
+    &engine,
+    &scope,
+    SchemaId("default".to_string()),
+    schema,
+    None,
+)
+.await?;
+
+let doc = Object { namespace: "doc".into(), id: "roadmap".into() };
+let alice = Subject::Entity(Object { namespace: "user".into(), id: "alice".into() });
+
+engine.write_tuples(&scope, vec![TupleUpdate::Write(Tuple {
+    object: doc.clone(),
+    relation: "editor".into(),
+    subject: alice.clone(),
+})]).await?;
+
+let decision = engine.check(&scope, &alice, "viewer", &doc).await?;
+assert!(decision.allowed);
 ```
 
-#### Step 2: Build the Typed Wrapper
+## Versioned Schemas
+
+`apply_schema` was removed in `0.2`. Schema management is explicit:
+
+1. `put_schema(storage_tenant, schema_id, schema)` stores an immutable schema revision.
+2. `bind_schema(scope, schema_ref, expected_generation)` binds a realm to a specific revision.
+3. `get_schema(storage_tenant, schema_id, revision)` retrieves a latest or exact revision.
+4. `get_schema_binding(scope)` returns the active binding for a realm.
+
+Use `put_and_bind_schema` for the common bootstrap path.
+
+## Anvil Backend
+
+Enable the `anvil` feature and construct an `AnvilRebacEngine` with an `anvil-storage` client:
 
 ```rust
-pub struct DriveAuth {
-    engine: PostgresRebacEngine,
-    tenant_id: i64,
-}
+use anvil_storage::AnvilClient;
+use zanzibar::anvil::AnvilRebacEngine;
 
-impl DriveAuth {
-    pub async fn add_doc_to_folder(&self, doc_id: &str, folder_id: &str) -> Result<(), RebacError> {
-        self.engine.write_tuples(self.tenant_id, vec![TupleUpdate::Write(Tuple {
-            object: Object { namespace: "doc".into(), id: doc_id.into() },
-            relation: "parent".into(),
-            subject: Subject::Entity(Object { namespace: "folder".into(), id: folder_id.into() }),
-        })]).await
-    }
-
-    pub async fn add_folder_viewer(&self, folder_id: &str, user_id: &str) -> Result<(), RebacError> {
-        self.engine.write_tuples(self.tenant_id, vec![TupleUpdate::Write(Tuple {
-            object: Object { namespace: "folder".into(), id: folder_id.into() },
-            relation: "viewer".into(),
-            subject: Subject::Entity(Object { namespace: "user".into(), id: user_id.into() }),
-        })]).await
-    }
-
-    pub async fn can_view_doc(&self, user_id: &str, doc_id: &str) -> Result<bool, RebacError> {
-        let user = Subject::Entity(Object { namespace: "user".into(), id: user_id.into() });
-        let doc = Object { namespace: "doc".into(), id: doc_id.into() };
-        self.engine.check(self.tenant_id, &user, "viewer", &doc).await
-    }
-}
+let client = AnvilClient::connect_with_bearer("http://127.0.0.1:50051", token).await?;
+let engine = AnvilRebacEngine::new(client);
 ```
 
-#### Step 3: Use the Wrapper
-Your business logic is now incredibly clean, secure, and type-safe.
+The Anvil backend uses the same `RebacEngine` trait as Postgres. The caller must use an `AuthzScope` whose storage tenant matches the authenticated Anvil tenant.
 
-```rust
-let auth = DriveAuth { engine, tenant_id };
+## Testing
 
-// 1. Add doc_1 inside folder_X
-auth.add_doc_to_folder("1", "X").await?;
-
-// 2. Make Alice a viewer of folder_X
-auth.add_folder_viewer("X", "alice").await?;
-
-// 3. Alice can now view doc_1 because it is in folder_X!
-let can_view = auth.can_view_doc("alice", "1").await?;
-assert!(can_view); // true
-```
-
----
-
-## 📈 Performance & Scaling
-
-`zanzibar` includes a high-performance benchmarking suite. Using a local PostgreSQL 16 instance, the engine yields the following p50 latencies:
-
-| Scenario | Tuple Count | Latency (P50) | Description |
-| :--- | :--- | :--- | :--- |
-| **Micro: Width** | 1,000 | `0.6ms` | Direct hit against a document with 1,000 direct viewers. |
-| **Micro: Depth** | 50 Levels | `1.8ms` | Traversal check against 50 deeply nested parent folders. |
-| **Enterprise: Load** | **10,000,000** | `331ms` | 100 concurrent workers hammering the DB simultaneously with exhaustive miss queries on 10 million tuples. |
-
-### Enterprise Scaling Roadmap
-Relying entirely on PostgreSQL Recursive CTEs works phenomenally up to around ~10 Million rows, at which point the memory overhead of the intermediate join sets (`work_mem`) begins to cause latency spikes. 
-
-For future releases, `zanzibar` plans to incorporate:
-1. **Application-Layer Traversal:** Moving graph compute out of Postgres and into asynchronous Rust `tokio` tasks for infinite horizontal scalability.
-2. **Reachability Caching:** Integrating Bloom Filters to instantly reject negative lookups without hitting the database.
-
-## 🤝 Contributing
-We welcome contributions! Please ensure you run the `proptest` graph fuzzer and the `criterion` benchmarks before submitting a PR.
+Postgres tests use `WORKA_CLOUD_DATABASE_URL` when set:
 
 ```bash
-# Run property-based correctness fuzzer
-cargo test --test proptest_graph
+WORKA_CLOUD_DATABASE_URL=postgresql://worka:worka@localhost:55432/worka \
+  cargo test --no-default-features
+```
 
-# Run micro-benchmarks
-cargo bench
+Anvil backend tests are ignored by default because they require a running Anvil server and token or client credentials:
 
-# Run the 10-Million row stress test
-cargo run --release --bin stress_test -- --rows 10000000
+```bash
+ANVIL_E2E_GRPC=http://127.0.0.1:50051 \
+ANVIL_E2E_CLIENT_ID=... \
+ANVIL_E2E_CLIENT_SECRET=... \
+  cargo test --features anvil --test anvil_backend -- --ignored
 ```

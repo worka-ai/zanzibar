@@ -1,13 +1,16 @@
 use proptest::prelude::*;
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use zanzibar::postgres::PostgresRebacEngine;
-use zanzibar::{NamespaceConfig, Object, RebacEngine, SchemaBuilder, Subject, Tuple, TupleUpdate};
+use zanzibar::{
+    AuthzScope, NamespaceConfig, Object, RebacEngine, SchemaBuilder, SchemaId, Subject, Tuple,
+    TupleUpdate, put_and_bind_schema,
+};
 
 mod common;
 
-static TENANT_COUNTER: AtomicI64 = AtomicI64::new(0);
+static SCOPE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static INIT_ONCE: std::sync::Once = std::sync::Once::new();
 
 async fn setup_db() -> PgPool {
@@ -16,18 +19,21 @@ async fn setup_db() -> PgPool {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
-        TENANT_COUNTER.store((now % 1_000_000_000_000) as i64, Ordering::SeqCst);
+        SCOPE_COUNTER.store(now % 1_000_000_000_000, Ordering::SeqCst);
     });
 
-    let pool = PgPool::connect("postgresql://worka:worka@localhost:5432/worka")
+    let database_url = std::env::var("WORKA_CLOUD_DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql://worka:worka@localhost:5432/worka".to_string());
+    let pool = PgPool::connect(&database_url)
         .await
         .expect("Failed to connect to db");
     common::ensure_schema(&pool).await;
     pool
 }
 
-fn next_tenant_id() -> i64 {
-    TENANT_COUNTER.fetch_add(1, Ordering::SeqCst)
+fn next_scope() -> AuthzScope {
+    let id = SCOPE_COUNTER.fetch_add(1, Ordering::SeqCst);
+    AuthzScope::new("proptest-storage", format!("realm-{id}"))
 }
 
 #[derive(Debug, Clone)]
@@ -141,7 +147,7 @@ proptest! {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let pool = setup_db().await;
             let engine = PostgresRebacEngine::new(pool);
-            let tenant_id = next_tenant_id();
+            let scope = next_scope();
 
             // Schema:
             // - Doc can have viewers (inherits from owner, but we'll just test viewers)
@@ -160,7 +166,7 @@ proptest! {
                 })
                 .build();
 
-            engine.apply_schema(tenant_id, schema).await.unwrap();
+            put_and_bind_schema(&engine, &scope, SchemaId("default".to_string()), schema, None).await.unwrap();
 
             let mut updates = Vec::new();
             for t in &tuples {
@@ -196,7 +202,7 @@ proptest! {
             }
 
             if !updates.is_empty() {
-                engine.write_tuples(tenant_id, updates).await.unwrap();
+                engine.write_tuples(&scope, updates).await.unwrap();
             }
 
             // Verify all possible (doc, user) combinations against the Oracle
@@ -209,7 +215,7 @@ proptest! {
                     let user_sub = Subject::Entity(Object { namespace: "user".into(), id: user_id.clone() });
 
                     let oracle_answer = check_oracle(&tuples, &doc_id, &user_id);
-                    let engine_answer = engine.check(tenant_id, &user_sub, "viewer", &doc_obj).await.unwrap();
+                    let engine_answer = engine.check(&scope, &user_sub, "viewer", &doc_obj).await.unwrap().allowed;
 
                     assert_eq!(
                         oracle_answer,

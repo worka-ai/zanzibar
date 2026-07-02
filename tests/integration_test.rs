@@ -1,11 +1,15 @@
 use sqlx::PgPool;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use zanzibar::postgres::PostgresRebacEngine;
-use zanzibar::{Object, RebacEngine, Subject, Tuple, TupleUpdate};
+use zanzibar::{
+    AuthzScope, BindingGeneration, NamespaceConfig, Object, RebacEngine, RelationRule, Schema,
+    SchemaBuilder, SchemaId, Subject, Tuple, TupleUpdate, put_and_bind_schema,
+};
 
 mod common;
 
-static TENANT_COUNTER: AtomicI64 = AtomicI64::new(0);
+static COUNTER: AtomicU64 = AtomicU64::new(0);
 static INIT_ONCE: std::sync::Once = std::sync::Once::new();
 
 async fn setup_db() -> PgPool {
@@ -14,8 +18,7 @@ async fn setup_db() -> PgPool {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
-        // Use nanoseconds to make collisions across separate 'cargo test' runs highly unlikely
-        TENANT_COUNTER.store((now % 1_000_000_000_000) as i64, Ordering::SeqCst);
+        COUNTER.store(now % 1_000_000_000_000, Ordering::SeqCst);
     });
 
     let database_url = std::env::var("WORKA_CLOUD_DATABASE_URL")
@@ -23,69 +26,89 @@ async fn setup_db() -> PgPool {
     let pool = PgPool::connect(&database_url)
         .await
         .expect("Failed to connect to db");
-
     common::ensure_schema(&pool).await;
-
     pool
 }
 
-fn next_tenant_id() -> i64 {
-    TENANT_COUNTER.fetch_add(1, Ordering::SeqCst)
+fn next_scope() -> AuthzScope {
+    let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+    AuthzScope::new("postgres-test", format!("realm-{id}"))
+}
+
+fn base_schema() -> Schema {
+    SchemaBuilder::new()
+        .namespace(
+            "doc",
+            NamespaceConfig {
+                rules: HashMap::from([("viewer".to_string(), vec![])]),
+            },
+        )
+        .namespace(
+            "group",
+            NamespaceConfig {
+                rules: HashMap::from([("member".to_string(), vec![])]),
+            },
+        )
+        .build()
+}
+
+async fn bind_base_schema(engine: &PostgresRebacEngine, scope: &AuthzScope) {
+    put_and_bind_schema(
+        engine,
+        scope,
+        SchemaId("default".to_string()),
+        base_schema(),
+        None,
+    )
+    .await
+    .unwrap();
+}
+
+fn user(id: &str) -> Subject {
+    Subject::Entity(Object {
+        namespace: "user".into(),
+        id: id.into(),
+    })
+}
+
+fn object(namespace: &str, id: &str) -> Object {
+    Object {
+        namespace: namespace.into(),
+        id: id.into(),
+    }
 }
 
 #[tokio::test]
 async fn test_basic_tuple_read_write() {
     let pool = setup_db().await;
     let engine = PostgresRebacEngine::new(pool);
-    let tenant_id = next_tenant_id();
+    let scope = next_scope();
+    bind_base_schema(&engine, &scope).await;
 
     let tuple = Tuple {
-        object: Object {
-            namespace: "doc".into(),
-            id: "1".into(),
-        },
+        object: object("doc", "1"),
         relation: "viewer".into(),
-        subject: Subject::Entity(Object {
-            namespace: "user".into(),
-            id: "alice".into(),
-        }),
+        subject: user("alice"),
     };
 
     engine
-        .write_tuples(tenant_id, vec![TupleUpdate::Write(tuple.clone())])
+        .write_tuples(&scope, vec![TupleUpdate::Write(tuple.clone())])
         .await
         .unwrap();
 
     let tuples = engine
-        .read_tuples(
-            tenant_id,
-            Some(Object {
-                namespace: "doc".into(),
-                id: "1".into(),
-            }),
-            None,
-            None,
-        )
+        .read_tuples(&scope, Some(object("doc", "1")), None, None)
         .await
         .unwrap();
     assert_eq!(tuples.len(), 1);
     assert_eq!(tuples[0], tuple);
 
-    // Delete
     engine
-        .write_tuples(tenant_id, vec![TupleUpdate::Delete(tuple)])
+        .write_tuples(&scope, vec![TupleUpdate::Delete(tuple)])
         .await
         .unwrap();
     let tuples = engine
-        .read_tuples(
-            tenant_id,
-            Some(Object {
-                namespace: "doc".into(),
-                id: "1".into(),
-            }),
-            None,
-            None,
-        )
+        .read_tuples(&scope, Some(object("doc", "1")), None, None)
         .await
         .unwrap();
     assert_eq!(tuples.len(), 0);
@@ -95,29 +118,23 @@ async fn test_basic_tuple_read_write() {
 async fn test_check_direct() {
     let pool = setup_db().await;
     let engine = PostgresRebacEngine::new(pool);
-    let tenant_id = next_tenant_id();
+    let scope = next_scope();
+    bind_base_schema(&engine, &scope).await;
 
-    let alice = Subject::Entity(Object {
-        namespace: "user".into(),
-        id: "alice".into(),
-    });
-    let doc1 = Object {
-        namespace: "doc".into(),
-        id: "1".into(),
-    };
+    let alice = user("alice");
+    let doc1 = object("doc", "1");
 
-    // Initially no access
     assert!(
         !engine
-            .check(tenant_id, &alice, "viewer", &doc1)
+            .check(&scope, &alice, "viewer", &doc1)
             .await
             .unwrap()
+            .allowed
     );
 
-    // Grant access
     engine
         .write_tuples(
-            tenant_id,
+            &scope,
             vec![TupleUpdate::Write(Tuple {
                 object: doc1.clone(),
                 relation: "viewer".into(),
@@ -127,12 +144,12 @@ async fn test_check_direct() {
         .await
         .unwrap();
 
-    // Now has access
     assert!(
         engine
-            .check(tenant_id, &alice, "viewer", &doc1)
+            .check(&scope, &alice, "viewer", &doc1)
             .await
             .unwrap()
+            .allowed
     );
 }
 
@@ -140,25 +157,16 @@ async fn test_check_direct() {
 async fn test_check_userset_recursive() {
     let pool = setup_db().await;
     let engine = PostgresRebacEngine::new(pool);
-    let tenant_id = next_tenant_id();
+    let scope = next_scope();
+    bind_base_schema(&engine, &scope).await;
 
-    let alice = Subject::Entity(Object {
-        namespace: "user".into(),
-        id: "alice".into(),
-    });
-    let group_a = Object {
-        namespace: "group".into(),
-        id: "a".into(),
-    };
-    let doc1 = Object {
-        namespace: "doc".into(),
-        id: "1".into(),
-    };
+    let alice = user("alice");
+    let group_a = object("group", "a");
+    let doc1 = object("doc", "1");
 
-    // Group A members are viewers of Doc 1
     engine
         .write_tuples(
-            tenant_id,
+            &scope,
             vec![TupleUpdate::Write(Tuple {
                 object: doc1.clone(),
                 relation: "viewer".into(),
@@ -173,15 +181,15 @@ async fn test_check_userset_recursive() {
 
     assert!(
         !engine
-            .check(tenant_id, &alice, "viewer", &doc1)
+            .check(&scope, &alice, "viewer", &doc1)
             .await
             .unwrap()
+            .allowed
     );
 
-    // Alice becomes member of Group A
     engine
         .write_tuples(
-            tenant_id,
+            &scope,
             vec![TupleUpdate::Write(Tuple {
                 object: group_a.clone(),
                 relation: "member".into(),
@@ -193,9 +201,10 @@ async fn test_check_userset_recursive() {
 
     assert!(
         engine
-            .check(tenant_id, &alice, "viewer", &doc1)
+            .check(&scope, &alice, "viewer", &doc1)
             .await
             .unwrap()
+            .allowed
     );
 }
 
@@ -203,24 +212,16 @@ async fn test_check_userset_recursive() {
 async fn test_list_objects_and_subjects() {
     let pool = setup_db().await;
     let engine = PostgresRebacEngine::new(pool);
-    let tenant_id = next_tenant_id();
+    let scope = next_scope();
+    bind_base_schema(&engine, &scope).await;
 
-    let alice = Subject::Entity(Object {
-        namespace: "user".into(),
-        id: "alice".into(),
-    });
-    let doc1 = Object {
-        namespace: "doc".into(),
-        id: "1".into(),
-    };
-    let doc2 = Object {
-        namespace: "doc".into(),
-        id: "2".into(),
-    };
+    let alice = user("alice");
+    let doc1 = object("doc", "1");
+    let doc2 = object("doc", "2");
 
     engine
         .write_tuples(
-            tenant_id,
+            &scope,
             vec![
                 TupleUpdate::Write(Tuple {
                     object: doc1.clone(),
@@ -238,41 +239,42 @@ async fn test_list_objects_and_subjects() {
         .unwrap();
 
     let mut objects = engine
-        .list_objects(tenant_id, &alice, "viewer", "doc")
+        .list_objects(&scope, &alice, "viewer", "doc")
         .await
-        .unwrap();
+        .unwrap()
+        .object_ids;
     objects.sort();
     assert_eq!(objects, vec!["1".to_string(), "2".to_string()]);
 
     let mut subjects = engine
-        .list_subjects(tenant_id, &doc1, "viewer", "user")
+        .list_subjects(&scope, &doc1, "viewer", "user")
         .await
-        .unwrap();
+        .unwrap()
+        .subject_ids;
     subjects.sort();
     assert_eq!(subjects, vec!["alice".to_string()]);
 }
 
 #[tokio::test]
-async fn test_multi_tenant_isolation() {
+async fn test_multi_realm_and_storage_tenant_isolation() {
     let pool = setup_db().await;
     let engine = PostgresRebacEngine::new(pool);
+    let scope_a = next_scope();
+    let scope_b = AuthzScope::new(
+        scope_a.anvil_storage_tenant_id.0.clone(),
+        format!("{}-other", scope_a.authz_realm_id.0),
+    );
+    let scope_c = AuthzScope::new("other-storage-tenant", scope_a.authz_realm_id.0.clone());
+    bind_base_schema(&engine, &scope_a).await;
+    bind_base_schema(&engine, &scope_b).await;
+    bind_base_schema(&engine, &scope_c).await;
 
-    let tenant_1 = next_tenant_id();
-    let tenant_2 = next_tenant_id();
+    let alice = user("alice");
+    let doc1 = object("doc", "1");
 
-    let alice = Subject::Entity(Object {
-        namespace: "user".into(),
-        id: "alice".into(),
-    });
-    let doc1 = Object {
-        namespace: "doc".into(),
-        id: "1".into(),
-    };
-
-    // Tenant 1 grants access
     engine
         .write_tuples(
-            tenant_1,
+            &scope_a,
             vec![TupleUpdate::Write(Tuple {
                 object: doc1.clone(),
                 relation: "viewer".into(),
@@ -282,55 +284,162 @@ async fn test_multi_tenant_isolation() {
         .await
         .unwrap();
 
-    // Tenant 1 has access
     assert!(
         engine
-            .check(tenant_1, &alice, "viewer", &doc1)
+            .check(&scope_a, &alice, "viewer", &doc1)
             .await
             .unwrap()
+            .allowed
     );
-
-    // Tenant 2 does NOT have access (isolation)
     assert!(
         !engine
-            .check(tenant_2, &alice, "viewer", &doc1)
+            .check(&scope_b, &alice, "viewer", &doc1)
             .await
             .unwrap()
+            .allowed
     );
+    assert!(
+        !engine
+            .check(&scope_c, &alice, "viewer", &doc1)
+            .await
+            .unwrap()
+            .allowed
+    );
+}
+
+#[tokio::test]
+async fn test_schema_revision_and_binding_generation() {
+    let pool = setup_db().await;
+    let engine = PostgresRebacEngine::new(pool);
+    let scope = next_scope();
+    let schema_id = SchemaId("default".to_string());
+
+    let schema_v1 = base_schema();
+    let ref_v1 = engine
+        .put_schema(
+            &scope.anvil_storage_tenant_id,
+            schema_id.clone(),
+            schema_v1.clone(),
+        )
+        .await
+        .unwrap();
+    let ref_v1_again = engine
+        .put_schema(&scope.anvil_storage_tenant_id, schema_id.clone(), schema_v1)
+        .await
+        .unwrap();
+    assert_eq!(ref_v1, ref_v1_again);
+
+    let schema_v2 = SchemaBuilder::new()
+        .namespace(
+            "doc",
+            NamespaceConfig {
+                rules: HashMap::from([
+                    (
+                        "viewer".to_string(),
+                        vec![RelationRule::Inherit("editor".to_string())],
+                    ),
+                    ("editor".to_string(), vec![]),
+                ]),
+            },
+        )
+        .namespace(
+            "group",
+            NamespaceConfig {
+                rules: HashMap::from([("member".to_string(), vec![])]),
+            },
+        )
+        .build();
+    let ref_v2 = engine
+        .put_schema(&scope.anvil_storage_tenant_id, schema_id.clone(), schema_v2)
+        .await
+        .unwrap();
+    assert_ne!(ref_v1.schema_revision, ref_v2.schema_revision);
+
+    let binding1 = engine.bind_schema(&scope, ref_v1, None).await.unwrap();
+    assert_eq!(binding1.binding_generation, BindingGeneration(1));
+    let stale = engine
+        .bind_schema(&scope, ref_v2.clone(), Some(BindingGeneration(1)))
+        .await
+        .unwrap();
+    assert_eq!(stale.binding_generation, BindingGeneration(2));
+    let err = engine
+        .bind_schema(&scope, ref_v2, Some(BindingGeneration(1)))
+        .await
+        .expect_err("stale generation must fail");
+    assert!(err.to_string().contains("generation conflict"));
+}
+
+#[tokio::test]
+async fn test_tuple_writes_require_bound_schema_and_known_relation() {
+    let pool = setup_db().await;
+    let engine = PostgresRebacEngine::new(pool);
+    let scope = next_scope();
+    let alice = user("alice");
+
+    let err = engine
+        .write_tuples(
+            &scope,
+            vec![TupleUpdate::Write(Tuple {
+                object: object("doc", "1"),
+                relation: "viewer".into(),
+                subject: alice.clone(),
+            })],
+        )
+        .await
+        .expect_err("no binding must fail");
+    assert!(err.to_string().contains("schema binding not found"));
+
+    bind_base_schema(&engine, &scope).await;
+    let err = engine
+        .write_tuples(
+            &scope,
+            vec![TupleUpdate::Write(Tuple {
+                object: object("doc", "1"),
+                relation: "editor".into(),
+                subject: alice,
+            })],
+        )
+        .await
+        .expect_err("unknown relation must fail");
+    assert!(err.to_string().contains("unknown relation"));
 }
 
 #[tokio::test]
 async fn test_computed_relation_inheritance() {
     let pool = setup_db().await;
     let engine = PostgresRebacEngine::new(pool);
-    let tenant_id = next_tenant_id();
+    let scope = next_scope();
 
-    let alice = Subject::Entity(Object {
-        namespace: "user".into(),
-        id: "alice".into(),
-    });
-    let agent1 = Object {
-        namespace: "agent".into(),
-        id: "worka.onboarding".into(),
-    };
-
-    // Define Schema: owner inherits into can_invoke
-    let mut rules = std::collections::HashMap::new();
-    rules.insert(
-        "can_invoke".to_string(),
-        vec![zanzibar::RelationRule::Inherit("owner".to_string())],
-    );
-
-    let schema = zanzibar::SchemaBuilder::new()
-        .namespace("agent", zanzibar::NamespaceConfig { rules })
+    let schema = SchemaBuilder::new()
+        .namespace(
+            "agent",
+            NamespaceConfig {
+                rules: HashMap::from([
+                    (
+                        "can_invoke".to_string(),
+                        vec![RelationRule::Inherit("owner".to_string())],
+                    ),
+                    ("owner".to_string(), vec![]),
+                ]),
+            },
+        )
         .build();
+    put_and_bind_schema(
+        &engine,
+        &scope,
+        SchemaId("default".to_string()),
+        schema,
+        None,
+    )
+    .await
+    .unwrap();
 
-    engine.apply_schema(tenant_id, schema).await.unwrap();
+    let alice = user("alice");
+    let agent1 = object("agent", "worka.onboarding");
 
-    // Grant ONLY 'owner'
     engine
         .write_tuples(
-            tenant_id,
+            &scope,
             vec![TupleUpdate::Write(Tuple {
                 object: agent1.clone(),
                 relation: "owner".into(),
@@ -340,27 +449,25 @@ async fn test_computed_relation_inheritance() {
         .await
         .unwrap();
 
-    // Check 'owner' (direct)
     assert!(
         engine
-            .check(tenant_id, &alice, "owner", &agent1)
+            .check(&scope, &alice, "owner", &agent1)
             .await
             .unwrap()
+            .allowed
     );
-
-    // Check 'can_invoke' (computed/inherited)
     assert!(
         engine
-            .check(tenant_id, &alice, "can_invoke", &agent1)
+            .check(&scope, &alice, "can_invoke", &agent1)
             .await
             .unwrap()
+            .allowed
     );
-
-    // Check 'something_else' (should be false)
     assert!(
         !engine
-            .check(tenant_id, &alice, "viewer", &agent1)
+            .check(&scope, &alice, "viewer", &agent1)
             .await
             .unwrap()
+            .allowed
     );
 }

@@ -143,6 +143,23 @@ impl Default for SchemaBuilder {
 pub enum RebacError {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
+    #[error("schema not found: {0}")]
+    SchemaNotFound(String),
+    #[error("schema binding not found for scope: {0:?}")]
+    SchemaBindingNotFound(AuthzScope),
+    #[error("schema binding rejected: {0}")]
+    SchemaBindingRejected(String),
+    #[error("schema binding generation conflict: expected {expected:?}, actual {actual:?}")]
+    SchemaBindingGenerationConflict {
+        expected: Option<BindingGeneration>,
+        actual: Option<BindingGeneration>,
+    },
+    #[error("schema binding is in progress for scope: {0:?}")]
+    SchemaBindingInProgress(AuthzScope),
+    #[error("invalid schema: {0}")]
+    InvalidSchema(String),
+    #[error("invalid tuple: {0}")]
+    InvalidTuple(String),
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -154,20 +171,154 @@ pub struct CheckRequest {
     pub object: Object,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AnvilStorageTenantId(pub String);
+
+impl From<&str> for AnvilStorageTenantId {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl From<String> for AnvilStorageTenantId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AuthzRealmId(pub String);
+
+impl From<&str> for AuthzRealmId {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl From<String> for AuthzRealmId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AuthzScope {
+    pub anvil_storage_tenant_id: AnvilStorageTenantId,
+    pub authz_realm_id: AuthzRealmId,
+}
+
+impl AuthzScope {
+    pub fn new(
+        anvil_storage_tenant_id: impl Into<AnvilStorageTenantId>,
+        authz_realm_id: impl Into<AuthzRealmId>,
+    ) -> Self {
+        Self {
+            anvil_storage_tenant_id: anvil_storage_tenant_id.into(),
+            authz_realm_id: authz_realm_id.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SchemaId(pub String);
+
+impl From<&str> for SchemaId {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl From<String> for SchemaId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SchemaRevision(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BindingGeneration(pub u64);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchemaRef {
+    pub schema_id: SchemaId,
+    pub schema_revision: SchemaRevision,
+    pub schema_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchemaBinding {
+    pub scope: AuthzScope,
+    pub schema_ref: SchemaRef,
+    pub binding_generation: BindingGeneration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthzDecisionMetadata {
+    pub scope: AuthzScope,
+    pub schema_ref: SchemaRef,
+    pub authz_revision: u64,
+    pub zookie: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckDecision {
+    pub allowed: bool,
+    pub metadata: AuthzDecisionMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthzWriteResult {
+    pub metadata: AuthzDecisionMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListObjectsResult {
+    pub object_ids: Vec<String>,
+    pub metadata: AuthzDecisionMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListSubjectsResult {
+    pub subject_ids: Vec<String>,
+    pub metadata: AuthzDecisionMetadata,
+}
+
 #[async_trait]
 pub trait RebacEngine: Send + Sync {
-    /// Persists the Authorization Schema (Relation Algebra) to the database.
-    async fn apply_schema(&self, tenant_id: i64, schema: Schema) -> Result<(), RebacError>;
+    async fn put_schema(
+        &self,
+        storage_tenant: &AnvilStorageTenantId,
+        schema_id: SchemaId,
+        schema: Schema,
+    ) -> Result<SchemaRef, RebacError>;
+
+    async fn get_schema(
+        &self,
+        storage_tenant: &AnvilStorageTenantId,
+        schema_id: &SchemaId,
+        revision: Option<SchemaRevision>,
+    ) -> Result<(SchemaRef, Schema), RebacError>;
+
+    async fn bind_schema(
+        &self,
+        scope: &AuthzScope,
+        schema_ref: SchemaRef,
+        expected_generation: Option<BindingGeneration>,
+    ) -> Result<SchemaBinding, RebacError>;
+
+    async fn get_schema_binding(&self, scope: &AuthzScope) -> Result<SchemaBinding, RebacError>;
 
     async fn write_tuples(
         &self,
-        tenant_id: i64,
+        scope: &AuthzScope,
         updates: Vec<TupleUpdate>,
-    ) -> Result<(), RebacError>;
+    ) -> Result<AuthzWriteResult, RebacError>;
 
     async fn read_tuples(
         &self,
-        tenant_id: i64,
+        scope: &AuthzScope,
         object: Option<Object>,
         relation: Option<String>,
         subject: Option<Subject>,
@@ -175,33 +326,48 @@ pub trait RebacEngine: Send + Sync {
 
     async fn check(
         &self,
-        tenant_id: i64,
+        scope: &AuthzScope,
         subject: &Subject,
         relation: &str,
         object: &Object,
-    ) -> Result<bool, RebacError>;
+    ) -> Result<CheckDecision, RebacError>;
 
     async fn check_many(
         &self,
-        tenant_id: i64,
+        scope: &AuthzScope,
         requests: Vec<CheckRequest>,
-    ) -> Result<Vec<bool>, RebacError>;
+    ) -> Result<Vec<CheckDecision>, RebacError>;
 
     async fn list_objects(
         &self,
-        tenant_id: i64,
+        scope: &AuthzScope,
         subject: &Subject,
         relation: &str,
         object_namespace: &str,
-    ) -> Result<Vec<String>, RebacError>;
+    ) -> Result<ListObjectsResult, RebacError>;
 
     async fn list_subjects(
         &self,
-        tenant_id: i64,
+        scope: &AuthzScope,
         object: &Object,
         relation: &str,
         subject_namespace: &str,
-    ) -> Result<Vec<String>, RebacError>;
+    ) -> Result<ListSubjectsResult, RebacError>;
+}
+
+pub async fn put_and_bind_schema(
+    engine: &dyn RebacEngine,
+    scope: &AuthzScope,
+    schema_id: SchemaId,
+    schema: Schema,
+    expected_generation: Option<BindingGeneration>,
+) -> Result<SchemaBinding, RebacError> {
+    let schema_ref = engine
+        .put_schema(&scope.anvil_storage_tenant_id, schema_id, schema)
+        .await?;
+    engine
+        .bind_schema(scope, schema_ref, expected_generation)
+        .await
 }
 
 #[cfg(test)]
