@@ -15,8 +15,9 @@ pub struct AnvilConsistencyToken {
     pub zookie: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum AnvilConsistency {
+    #[default]
     Latest,
     Exact(String),
     AtLeast(String),
@@ -29,12 +30,6 @@ impl AnvilConsistency {
             Self::Exact(zookie) => ("exact", zookie.clone()),
             Self::AtLeast(zookie) => ("at_least", zookie.clone()),
         }
-    }
-}
-
-impl Default for AnvilConsistency {
-    fn default() -> Self {
-        Self::Latest
     }
 }
 
