@@ -1,6 +1,6 @@
 #![cfg(feature = "anvil")]
 
-use anvil_storage::AnvilClient;
+use anvil_storage::{AnvilClient, proto};
 use std::collections::HashMap;
 use std::time::Duration;
 use zanzibar::anvil::AnvilRebacEngine;
@@ -30,16 +30,39 @@ fn tuple(namespace: &str, object_id: &str, relation: &str, subject: Subject) -> 
 async fn engine() -> AnvilRebacEngine {
     let endpoint = std::env::var("ANVIL_E2E_GRPC")
         .expect("ANVIL_E2E_GRPC must point to an Anvil gRPC endpoint");
-    let token = std::env::var("ANVIL_E2E_TOKEN")
-        .expect("ANVIL_E2E_TOKEN must contain an Anvil bearer token with authz permissions");
+    let token = match std::env::var("ANVIL_E2E_TOKEN") {
+        Ok(token) => token,
+        Err(_) => fetch_e2e_token(&endpoint).await,
+    };
     let client = AnvilClient::connect_with_bearer(endpoint, token)
         .await
         .expect("connect to Anvil e2e endpoint");
     AnvilRebacEngine::new(client)
 }
 
+async fn fetch_e2e_token(endpoint: &str) -> String {
+    let client_id = std::env::var("ANVIL_E2E_CLIENT_ID")
+        .expect("ANVIL_E2E_CLIENT_ID must be set when ANVIL_E2E_TOKEN is absent");
+    let client_secret = std::env::var("ANVIL_E2E_CLIENT_SECRET")
+        .expect("ANVIL_E2E_CLIENT_SECRET must be set when ANVIL_E2E_TOKEN is absent");
+    let client = AnvilClient::connect(endpoint.to_string())
+        .await
+        .expect("connect to Anvil token endpoint");
+    client
+        .auth()
+        .get_access_token(proto::GetAccessTokenRequest {
+            client_id,
+            client_secret,
+            scopes: vec!["*".to_string()],
+        })
+        .await
+        .expect("obtain Anvil e2e access token")
+        .into_inner()
+        .access_token
+}
+
 #[tokio::test]
-#[ignore = "requires ANVIL_E2E_GRPC and ANVIL_E2E_TOKEN"]
+#[ignore = "requires ANVIL_E2E_GRPC plus ANVIL_E2E_TOKEN or ANVIL_E2E_CLIENT_ID/ANVIL_E2E_CLIENT_SECRET"]
 async fn anvil_backend_checks_direct_computed_tuple_to_userset_and_nested_usersets() {
     let engine = engine().await;
     let schema = SchemaBuilder::new()
@@ -179,7 +202,7 @@ async fn anvil_backend_checks_direct_computed_tuple_to_userset_and_nested_userse
 }
 
 #[tokio::test]
-#[ignore = "requires ANVIL_E2E_GRPC and ANVIL_E2E_TOKEN"]
+#[ignore = "requires ANVIL_E2E_GRPC plus ANVIL_E2E_TOKEN or ANVIL_E2E_CLIENT_ID/ANVIL_E2E_CLIENT_SECRET"]
 async fn anvil_backend_batch_write_is_atomic_and_watch_replays_from_revision() {
     let engine = engine().await;
     engine

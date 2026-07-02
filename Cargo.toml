@@ -14,7 +14,7 @@ repository = "https://github.com/worka-ai/zanzibar"
 
 [dependencies]
 anyhow = "1.0"
-anvil-storage = { git = "https://github.com/worka-ai/anvil.git", branch = "feature/posthorn-coordination-authz", optional = true }
+anvil-storage = { git = "https://github.com/worka-ai/anvil.git", branch = "main", optional = true }
 async-trait = "0.1.89"
 moka = { version = "0.12.14", features = ["future"] }
 serde = { version = "1.0", features = ["derive"] }
