@@ -1,3 +1,6 @@
+#[cfg(feature = "anvil")]
+pub mod anvil;
+
 pub mod postgres;
 
 pub const POSTGRES_SCHEMA: &str = include_str!("../schema.sql");
@@ -127,6 +130,12 @@ impl SchemaBuilder {
 
     pub fn build(self) -> Schema {
         self.schema
+    }
+}
+
+impl Default for SchemaBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

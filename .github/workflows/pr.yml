@@ -5,6 +5,10 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+  packages: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -29,9 +33,83 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Run format check
         run: cargo fmt --check
       - name: Run clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-features -- -D warnings
       - name: Run tests
-        run: cargo test
+        run: cargo test --all-features
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Start latest Anvil for backend tests
+        shell: bash
+        env:
+          ANVIL_IMAGE: ghcr.io/worka-ai/anvil:latest
+          ANVIL_SECRET_ENCRYPTION_KEY: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          JWT_SECRET: zanzibar-ci-jwt-secret
+        run: |
+          set -euo pipefail
+          docker pull "$ANVIL_IMAGE"
+          docker volume create zanzibar-anvil-e2e-data
+
+          admin() {
+            docker run --rm \
+              -e ANVIL_SECRET_ENCRYPTION_KEY="$ANVIL_SECRET_ENCRYPTION_KEY" \
+              -e STORAGE_PATH=/var/lib/anvil \
+              -v zanzibar-anvil-e2e-data:/var/lib/anvil \
+              "$ANVIL_IMAGE" admin "$@"
+          }
+
+          admin region create zanzibar-ci
+          admin tenant create zanzibar-ci
+          app_output=$(admin app create --tenant-name zanzibar-ci --app-name zanzibar-ci-app)
+          printf '%s\n' "$app_output"
+          client_id=$(printf '%s\n' "$app_output" | awk -F': ' '/Client ID:/ { print $2 }')
+          client_secret=$(printf '%s\n' "$app_output" | awk -F': ' '/Client Secret:/ { print $2 }')
+          test -n "$client_id"
+          test -n "$client_secret"
+          admin policy grant --app-name zanzibar-ci-app --action '*' --resource '*'
+
+          docker run -d --name zanzibar-anvil-e2e \
+            -p 50051:50051 \
+            -e JWT_SECRET="$JWT_SECRET" \
+            -e ANVIL_SECRET_ENCRYPTION_KEY="$ANVIL_SECRET_ENCRYPTION_KEY" \
+            -e CLUSTER_SECRET=zanzibar-ci-cluster-secret \
+            -e PUBLIC_API_ADDR=http://127.0.0.1:50051 \
+            -e API_LISTEN_ADDR=0.0.0.0:50051 \
+            -e CLUSTER_LISTEN_ADDR=/ip4/0.0.0.0/udp/0/quic-v1 \
+            -e REGION=zanzibar-ci \
+            -e INIT_CLUSTER=true \
+            -e ENABLE_MDNS=false \
+            -e STORAGE_PATH=/var/lib/anvil \
+            -v zanzibar-anvil-e2e-data:/var/lib/anvil \
+            "$ANVIL_IMAGE"
+
+          for _ in {1..120}; do
+            if curl -fsS http://127.0.0.1:50051/ready >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:50051/ready >/dev/null
+
+          {
+            echo 'ANVIL_E2E_GRPC=http://127.0.0.1:50051'
+            echo "ANVIL_E2E_CLIENT_ID=$client_id"
+            echo "ANVIL_E2E_CLIENT_SECRET=$client_secret"
+          } >> "$GITHUB_ENV"
+
+      - name: Run Anvil backend tests
+        run: cargo test --features anvil --test anvil_backend -- --ignored --nocapture --test-threads=1
+
+      - name: Dump Anvil logs
+        if: always()
+        run: docker logs zanzibar-anvil-e2e || true
