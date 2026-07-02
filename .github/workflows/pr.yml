@@ -29,6 +29,8 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Run format check
         run: cargo fmt --check
       - name: Run clippy
