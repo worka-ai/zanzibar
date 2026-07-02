@@ -11,6 +11,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tonic::Streaming;
 
+type SchemaCacheKey = (String, String, u64);
+type SchemaCache = Arc<RwLock<HashMap<SchemaCacheKey, Schema>>>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnvilConsistencyToken {
     pub revision: u64,
@@ -38,7 +41,7 @@ impl AnvilConsistency {
 #[derive(Clone)]
 pub struct AnvilRebacEngine {
     client: AnvilClient,
-    schemas: Arc<RwLock<HashMap<(String, String, u64), Schema>>>,
+    schemas: SchemaCache,
 }
 
 impl AnvilRebacEngine {

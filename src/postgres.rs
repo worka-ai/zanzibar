@@ -107,7 +107,7 @@ impl PostgresRebacEngine {
         .await
         .unwrap_or(None)
         .unwrap_or(0);
-        Ok(i64_to_u64(revision, "authz_revision")?)
+        i64_to_u64(revision, "authz_revision")
     }
 
     async fn advance_revision(
