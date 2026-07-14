@@ -1,9 +1,4 @@
-#[cfg(feature = "anvil")]
 pub mod anvil;
-
-pub mod postgres;
-
-pub const POSTGRES_SCHEMA: &str = include_str!("../schema.sql");
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -141,8 +136,8 @@ impl Default for SchemaBuilder {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RebacError {
-    #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
+    #[error("Anvil authorization error: {0}")]
+    Anvil(String),
     #[error("schema not found: {0}")]
     SchemaNotFound(String),
     #[error("schema binding not found for scope: {0:?}")]

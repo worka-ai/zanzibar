@@ -1,5 +1,3 @@
-#![cfg(feature = "anvil")]
-
 use anvil_storage::{AnvilClient, proto};
 use std::collections::HashMap;
 use std::time::Duration;
