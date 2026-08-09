@@ -1,178 +1,209 @@
-use crate::{
-    AnvilStorageTenantId, AuthzDecisionMetadata, AuthzScope, AuthzWriteResult, BindingGeneration,
-    CheckDecision, CheckRequest, ListObjectsResult, ListSubjectsResult, NamespaceConfig, Object,
-    RebacEngine, RebacError, RelationRule, Schema, SchemaBinding, SchemaId, SchemaRef,
-    SchemaRevision, Subject, Tuple, TupleUpdate,
-};
-use anvil_storage::{AnvilClient, proto};
-use async_trait::async_trait;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::BTreeSet;
+use std::fmt;
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use tonic::Streaming;
+use std::time::{Duration, Instant, SystemTime};
 
-type SchemaCacheKey = (String, String, u64);
-type SchemaCache = Arc<RwLock<HashMap<SchemaCacheKey, Schema>>>;
+use anvil_storage::v1::authz_consistency::Requirement;
+use anvil_storage::v1::object_filter::Selection;
+use anvil_storage::v1::object_ref::Id;
+use anvil_storage::v1::permission_rule::Rule;
+use anvil_storage::v1::relation_definition::Kind as RelationKind;
+use anvil_storage::v1::subject::Kind as SubjectKind;
+use anvil_storage::v1::subject_selector::Selector;
+use anvil_storage::v1::tuple_mutation::Operation;
+use anvil_storage::v1::{
+    AnyObjectSelector, AnyUsersetSelector, AtLeastRevision, AuthzConsistency as ProtoConsistency,
+    AuthzScope as ProtoScope, BindSchemaRequest, CheckPermissionRequest, CheckPermissionsRequest,
+    DirectRelation, ExactRevision, GetBindingRequest, GetSchemaRequest, InheritRule,
+    LatestConsistency, MutateTuplesRequest as ProtoMutateTuplesRequest,
+    NamespaceDefinition as ProtoNamespaceDefinition, ObjectFilter as ProtoObjectFilter, ObjectRef,
+    Permission, PermissionCheck, PermissionRule as ProtoPermissionRule, PublicSubjectSelector,
+    PutSchemaRequest, ReadTuplesRequest as ProtoReadTuplesRequest,
+    RelationDefinition as ProtoRelationDefinition, RelationTuple, SameResourceIdSelector,
+    SchemaBinding as ProtoSchemaBinding, SchemaRef as ProtoSchemaRef, Subject as ProtoSubject,
+    SubjectSelector as ProtoSubjectSelector, TupleFilter as ProtoTupleFilter,
+    TupleMutation as ProtoTupleMutation, TupleToUsersetRule, Userset,
+};
+use async_trait::async_trait;
+use tokio::sync::{Mutex, RwLock};
+use tonic::transport::Channel;
+use tonic::{Code, Status};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AnvilConsistencyToken {
-    pub revision: u64,
-    pub zookie: String,
+use crate::{
+    AnvilStorageTenantId, AuthzRevision, AuthzScope, BindSchemaResult, BindingGeneration,
+    CheckDecision, CheckManyResult, CheckRequest, Consistency, MutateTuplesRequest,
+    MutateTuplesResult, NamespaceDefinition, Object, ObjectFilter, PermissionRule, PutSchemaResult,
+    ReadTuplesPage, ReadTuplesRequest, RebacEngine, RebacError, RelationDefinition, Schema,
+    SchemaBinding, SchemaId, SchemaRef, SchemaRevision, Subject, SubjectSelector, Tuple,
+    TupleFilter, TupleUpdate,
+};
+
+const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(30);
+const TOKEN_EXCHANGE_ATTEMPTS: u32 = 12;
+const MAX_MUTATIONS: usize = 1_000;
+const MAX_CHECKS: usize = 1_000;
+const MAX_PAGE_SIZE: u32 = 1_000;
+const ANVIL_PUBLIC_NAMESPACE: &str = "app";
+const ANVIL_PUBLIC_ID: &str = "_anvil/public";
+
+/// Durable application credentials used to connect to one Anvil 0.5 cluster.
+#[derive(Clone)]
+pub struct AnvilRebacConfig {
+    pub endpoint: String,
+    pub storage_tenant: AnvilStorageTenantId,
+    pub client_id: String,
+    pub client_secret: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum AnvilConsistency {
-    #[default]
-    Latest,
-    Exact(String),
-    AtLeast(String),
-}
-
-impl AnvilConsistency {
-    fn as_request_parts(&self) -> (&'static str, String) {
-        match self {
-            Self::Latest => ("latest", String::new()),
-            Self::Exact(zookie) => ("exact", zookie.clone()),
-            Self::AtLeast(zookie) => ("at_least", zookie.clone()),
-        }
+impl fmt::Debug for AnvilRebacConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AnvilRebacConfig")
+            .field("endpoint", &self.endpoint)
+            .field("storage_tenant", &self.storage_tenant)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"<redacted>")
+            .finish()
     }
 }
 
 #[derive(Clone)]
+struct SessionToken {
+    value: String,
+    refresh_at: Instant,
+}
+
+struct AnvilSession {
+    config: AnvilRebacConfig,
+    channel: Channel,
+    token: RwLock<Option<SessionToken>>,
+    refresh: Mutex<()>,
+}
+
+impl fmt::Debug for AnvilSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AnvilSession")
+            .field("config", &self.config)
+            .field("channel", &"<channel>")
+            .finish()
+    }
+}
+
+impl AnvilSession {
+    async fn connect(config: AnvilRebacConfig) -> Result<Arc<Self>, RebacError> {
+        validate_config(&config)?;
+        let channel = anvil_storage::connect_channel(&config.endpoint)
+            .await
+            .map_err(|error| RebacError::Anvil(format!("failed to connect to Anvil: {error}")))?;
+        let session = Arc::new(Self {
+            config,
+            channel,
+            token: RwLock::new(None),
+            refresh: Mutex::new(()),
+        });
+        session.access_token().await?;
+        Ok(session)
+    }
+
+    async fn client(&self) -> Result<anvil_storage::RawAuthzClient, RebacError> {
+        let token = self.access_token().await?;
+        anvil_storage::authz_client(self.channel.clone(), &token)
+            .map_err(|error| RebacError::Internal(format!("invalid Anvil access token: {error}")))
+    }
+
+    async fn access_token(&self) -> Result<String, RebacError> {
+        if let Some(token) = self.current_token().await {
+            return Ok(token);
+        }
+
+        let _refresh = self.refresh.lock().await;
+        if let Some(token) = self.current_token().await {
+            return Ok(token);
+        }
+
+        let mut attempt = 0;
+        let response = loop {
+            match anvil_storage::exchange_client_credentials(
+                self.channel.clone(),
+                self.config.client_id.clone(),
+                self.config.client_secret.clone(),
+            )
+            .await
+            {
+                Ok(response) => break response,
+                Err(status)
+                    if attempt + 1 < TOKEN_EXCHANGE_ATTEMPTS
+                        && matches!(status.code(), Code::ResourceExhausted | Code::Unavailable) =>
+                {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(125 * u64::from(attempt))).await;
+                }
+                Err(status) => return Err(map_status(status)),
+            }
+        };
+        if response.access_token.trim().is_empty() || response.expires_in_seconds == 0 {
+            return Err(RebacError::Internal(
+                "Anvil credential exchange returned an empty or expired token".into(),
+            ));
+        }
+        let lifetime = Duration::from_secs(response.expires_in_seconds);
+        let margin = TOKEN_REFRESH_MARGIN.min(lifetime / 4);
+        let token = SessionToken {
+            value: response.access_token,
+            refresh_at: Instant::now() + lifetime.saturating_sub(margin),
+        };
+        let value = token.value.clone();
+        *self.token.write().await = Some(token);
+        Ok(value)
+    }
+
+    async fn current_token(&self) -> Option<String> {
+        self.token
+            .read()
+            .await
+            .as_ref()
+            .filter(|token| Instant::now() < token.refresh_at)
+            .map(|token| token.value.clone())
+    }
+}
+
+/// A thin authenticated adapter over Anvil's authoritative authorization API.
+#[derive(Clone)]
 pub struct AnvilRebacEngine {
-    client: AnvilClient,
-    schemas: SchemaCache,
+    session: Arc<AnvilSession>,
+}
+
+impl fmt::Debug for AnvilRebacEngine {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AnvilRebacEngine")
+            .field("session", &self.session)
+            .finish()
+    }
 }
 
 impl AnvilRebacEngine {
-    pub fn new(client: AnvilClient) -> Self {
-        Self {
-            client,
-            schemas: Arc::new(RwLock::new(HashMap::new())),
+    pub async fn connect(config: AnvilRebacConfig) -> Result<Self, RebacError> {
+        Ok(Self {
+            session: AnvilSession::connect(config).await?,
+        })
+    }
+
+    fn validate_storage_tenant(
+        &self,
+        storage_tenant: &AnvilStorageTenantId,
+    ) -> Result<(), RebacError> {
+        if storage_tenant != &self.session.config.storage_tenant {
+            return Err(RebacError::PermissionDenied(
+                "authorization tenant does not match the authenticated Anvil tenant".into(),
+            ));
         }
+        Ok(())
     }
 
-    pub async fn write_tuples_with_zookie(
-        &self,
-        scope: &AuthzScope,
-        updates: Vec<TupleUpdate>,
-    ) -> Result<Option<AnvilConsistencyToken>, RebacError> {
-        if updates.is_empty() {
-            return Ok(None);
-        }
-        let mutations = updates
-            .into_iter()
-            .map(tuple_update_to_mutation)
-            .collect::<Result<Vec<_>, _>>()?;
-        let response = self
-            .client
-            .auth()
-            .write_authz_tuples(proto::WriteAuthzTuplesRequest {
-                mutations,
-                scope: Some(scope_to_proto(scope)),
-            })
-            .await
-            .map_err(anvil_status)?
-            .into_inner();
-        Ok(Some(AnvilConsistencyToken {
-            revision: response.revision,
-            zookie: response.zookie,
-        }))
-    }
-
-    pub async fn read_tuples_with_consistency(
-        &self,
-        scope: &AuthzScope,
-        object: Option<Object>,
-        relation: Option<String>,
-        subject: Option<Subject>,
-        consistency: AnvilConsistency,
-    ) -> Result<(Vec<Tuple>, AnvilConsistencyToken), RebacError> {
-        let (subject_kind, subject_id) = match subject.as_ref() {
-            Some(subject) => {
-                let encoded = encode_subject(subject)?;
-                (encoded.subject_kind, encoded.subject_id)
-            }
-            None => (String::new(), String::new()),
-        };
-        let (consistency, zookie) = consistency.as_request_parts();
-        let mut client = self.client.auth();
-        let mut page_token = String::new();
-        let mut tuples = Vec::new();
-        let token = loop {
-            let response = client
-                .read_authz_tuples(proto::ReadAuthzTuplesRequest {
-                    namespace: object
-                        .as_ref()
-                        .map(|object| object.namespace.clone())
-                        .unwrap_or_default(),
-                    object_id: object
-                        .as_ref()
-                        .map(|object| object.id.clone())
-                        .unwrap_or_default(),
-                    relation: relation.clone().unwrap_or_default(),
-                    subject_kind: subject_kind.clone(),
-                    subject_id: subject_id.clone(),
-                    caveat_hash: String::new(),
-                    consistency: consistency.to_string(),
-                    zookie: zookie.clone(),
-                    page_size: 1000,
-                    page_token,
-                    scope: Some(scope_to_proto(scope)),
-                })
-                .await
-                .map_err(anvil_status)?
-                .into_inner();
-            let response_token = AnvilConsistencyToken {
-                revision: response.revision,
-                zookie: response.zookie.clone(),
-            };
-            for tuple in response.tuples {
-                tuples.push(tuple_from_proto(tuple)?);
-            }
-            if response.next_page_token.is_empty() {
-                break response_token;
-            }
-            page_token = response.next_page_token;
-        };
-        Ok((tuples, token))
-    }
-
-    pub async fn check_with_consistency(
-        &self,
-        scope: &AuthzScope,
-        subject: &Subject,
-        relation: &str,
-        object: &Object,
-        consistency: AnvilConsistency,
-    ) -> Result<(bool, AnvilConsistencyToken), RebacError> {
-        let binding = self.get_schema_binding(scope).await?;
-        let schema = self
-            .schema_for_ref(&scope.anvil_storage_tenant_id, &binding.schema_ref)
-            .await?;
-        let (tuples, token) = self
-            .read_tuples_with_consistency(scope, None, None, None, consistency)
-            .await?;
-        let view = TupleView::new(tuples);
-        Ok((view.check(&schema, object, relation, subject), token))
-    }
-
-    pub async fn watch_tuple_log(
-        &self,
-        scope: &AuthzScope,
-        after_revision: u64,
-        namespace: impl Into<String>,
-    ) -> Result<Streaming<proto::WatchAuthzTupleLogResponse>, RebacError> {
-        self.client
-            .auth()
-            .watch_authz_tuple_log(proto::WatchAuthzTupleLogRequest {
-                after_revision,
-                namespace: namespace.into(),
-                scope: Some(scope_to_proto(scope)),
-            })
-            .await
-            .map(|response| response.into_inner())
-            .map_err(anvil_status)
+    fn validate_scope(&self, scope: &AuthzScope) -> Result<(), RebacError> {
+        self.validate_storage_tenant(&scope.anvil_storage_tenant_id)
     }
 }
 
@@ -183,68 +214,56 @@ impl RebacEngine for AnvilRebacEngine {
         storage_tenant: &AnvilStorageTenantId,
         schema_id: SchemaId,
         schema: Schema,
-    ) -> Result<SchemaRef, RebacError> {
-        validate_schema(&schema)?;
-        let namespaces = schema_to_proto_namespaces(&schema)?;
+    ) -> Result<PutSchemaResult, RebacError> {
+        self.validate_storage_tenant(storage_tenant)?;
+        let namespaces = schema_to_proto(&schema)?;
         let response = self
-            .client
-            .auth()
-            .put_authz_schema(proto::PutAuthzSchemaRequest {
-                anvil_storage_tenant_id: storage_tenant.0.clone(),
+            .session
+            .client()
+            .await?
+            .put_schema(PutSchemaRequest {
                 schema_id: schema_id.0.clone(),
                 namespaces,
-                reason: "zanzibar schema put".to_string(),
             })
             .await
-            .map_err(anvil_status)?
+            .map_err(|status| map_schema_status(status, &schema_id))?
             .into_inner();
         let schema_ref = response
             .schema_ref
-            .map(schema_ref_from_proto)
-            .ok_or_else(|| RebacError::Internal("Anvil schema response missing ref".to_string()))?;
-        self.schemas.write().await.insert(
-            (
-                storage_tenant.0.clone(),
-                schema_ref.schema_id.0.clone(),
-                schema_ref.schema_revision.0,
-            ),
-            schema,
-        );
-        Ok(schema_ref)
+            .ok_or_else(|| {
+                RebacError::Internal("Anvil schema response omitted its reference".into())
+            })
+            .and_then(schema_ref_from_proto)?;
+        Ok(PutSchemaResult {
+            schema_ref,
+            revision: AuthzRevision(response.revision),
+            replayed: response.replayed,
+        })
     }
 
     async fn get_schema(
         &self,
         storage_tenant: &AnvilStorageTenantId,
-        schema_id: &SchemaId,
-        revision: Option<SchemaRevision>,
+        schema_ref: &SchemaRef,
     ) -> Result<(SchemaRef, Schema), RebacError> {
+        self.validate_storage_tenant(storage_tenant)?;
         let response = self
-            .client
-            .auth()
-            .get_authz_schema(proto::GetAuthzSchemaRequest {
-                namespace: String::new(),
-                anvil_storage_tenant_id: storage_tenant.0.clone(),
-                schema_id: schema_id.0.clone(),
-                schema_revision: revision.map(|revision| revision.0),
+            .session
+            .client()
+            .await?
+            .get_schema(GetSchemaRequest {
+                schema_ref: Some(schema_ref_to_proto(schema_ref)),
             })
             .await
-            .map_err(anvil_status)?
+            .map_err(|status| map_schema_status(status, &schema_ref.schema_id))?
             .into_inner();
-        let schema_ref = response
+        let response_ref = response
             .schema_ref
-            .map(schema_ref_from_proto)
-            .ok_or_else(|| RebacError::SchemaNotFound(schema_id.0.clone()))?;
-        let schema = schema_from_proto_namespaces(response.namespaces)?;
-        self.schemas.write().await.insert(
-            (
-                storage_tenant.0.clone(),
-                schema_ref.schema_id.0.clone(),
-                schema_ref.schema_revision.0,
-            ),
-            schema.clone(),
-        );
-        Ok((schema_ref, schema))
+            .ok_or_else(|| {
+                RebacError::Internal("Anvil schema response omitted its reference".into())
+            })
+            .and_then(schema_ref_from_proto)?;
+        Ok((response_ref, schema_from_proto(response.namespaces)?))
     }
 
     async fn bind_schema(
@@ -252,467 +271,594 @@ impl RebacEngine for AnvilRebacEngine {
         scope: &AuthzScope,
         schema_ref: SchemaRef,
         expected_generation: Option<BindingGeneration>,
-    ) -> Result<SchemaBinding, RebacError> {
+    ) -> Result<BindSchemaResult, RebacError> {
+        self.validate_scope(scope)?;
         let response = self
-            .client
-            .auth()
-            .bind_authz_schema(proto::BindAuthzSchemaRequest {
+            .session
+            .client()
+            .await?
+            .bind_schema(BindSchemaRequest {
                 scope: Some(scope_to_proto(scope)),
                 schema_ref: Some(schema_ref_to_proto(&schema_ref)),
-                expected_binding_generation: expected_generation.map(|generation| generation.0),
-                reason: "zanzibar schema bind".to_string(),
+                expected_binding_generation: expected_generation.map(|value| value.0),
             })
             .await
-            .map_err(anvil_status)?
+            .map_err(|status| {
+                map_binding_status(status, &schema_ref.schema_id, expected_generation)
+            })?
             .into_inner();
-        let response_ref = response
-            .schema_ref
-            .map(schema_ref_from_proto)
-            .ok_or_else(|| {
-                RebacError::Internal("Anvil binding response missing ref".to_string())
-            })?;
-        Ok(SchemaBinding {
-            scope: scope.clone(),
-            schema_ref: response_ref,
-            binding_generation: BindingGeneration(response.binding_generation),
+        let binding = response
+            .binding
+            .ok_or_else(|| RebacError::Internal("Anvil bind response omitted its binding".into()))
+            .and_then(binding_from_proto)?;
+        Ok(BindSchemaResult {
+            binding,
+            revision: AuthzRevision(response.revision),
         })
     }
 
     async fn get_schema_binding(&self, scope: &AuthzScope) -> Result<SchemaBinding, RebacError> {
+        self.validate_scope(scope)?;
         let response = self
-            .client
-            .auth()
-            .get_authz_schema_binding(proto::GetAuthzSchemaBindingRequest {
+            .session
+            .client()
+            .await?
+            .get_binding(GetBindingRequest {
                 scope: Some(scope_to_proto(scope)),
             })
             .await
-            .map_err(anvil_status)?
+            .map_err(|status| {
+                if status.code() == Code::NotFound {
+                    RebacError::SchemaBindingNotFound(scope.clone())
+                } else {
+                    map_status(status)
+                }
+            })?
             .into_inner();
-        let schema_ref = response
-            .schema_ref
-            .map(schema_ref_from_proto)
-            .ok_or_else(|| RebacError::SchemaBindingNotFound(scope.clone()))?;
-        Ok(SchemaBinding {
-            scope: scope.clone(),
-            schema_ref,
-            binding_generation: BindingGeneration(response.binding_generation),
-        })
+        response
+            .binding
+            .ok_or_else(|| {
+                RebacError::Internal("Anvil binding response omitted its binding".into())
+            })
+            .and_then(binding_from_proto)
     }
 
-    async fn write_tuples(
+    async fn mutate_tuples(
         &self,
-        scope: &AuthzScope,
-        updates: Vec<TupleUpdate>,
-    ) -> Result<AuthzWriteResult, RebacError> {
-        let binding = self.get_schema_binding(scope).await?;
-        let token = self
-            .write_tuples_with_zookie(scope, updates)
+        request: MutateTuplesRequest,
+    ) -> Result<MutateTuplesResult, RebacError> {
+        let (scope, operation_id, expected_revision, updates) = request.into_parts();
+        self.validate_scope(&scope)?;
+        if updates.is_empty() {
+            return Err(RebacError::InvalidMutation(
+                "tuple mutation batch must not be empty".into(),
+            ));
+        }
+        if updates.len() > MAX_MUTATIONS {
+            return Err(RebacError::ResourceExhausted(format!(
+                "tuple mutation batch exceeds the {MAX_MUTATIONS} item limit"
+            )));
+        }
+        let mutations = updates
+            .into_iter()
+            .map(tuple_update_to_proto)
+            .collect::<Result<Vec<_>, _>>()?;
+        let response = self
+            .session
+            .client()
             .await?
-            .unwrap_or(AnvilConsistencyToken {
-                revision: 0,
-                zookie: String::new(),
-            });
-        Ok(AuthzWriteResult {
-            metadata: AuthzDecisionMetadata {
-                scope: scope.clone(),
-                schema_ref: binding.schema_ref,
-                authz_revision: token.revision,
-                zookie: token.zookie,
-            },
+            .mutate_tuples(ProtoMutateTuplesRequest {
+                scope: Some(scope_to_proto(&scope)),
+                operation_id,
+                expected_revision: expected_revision.map(|value| value.0),
+                mutations,
+            })
+            .await
+            .map_err(|status| map_mutation_status(status, &scope))?
+            .into_inner();
+        let replay_guarantee_expires_at = response
+            .replay_guarantee_expires_at
+            .map(SystemTime::try_from)
+            .transpose()
+            .map_err(|error| {
+                RebacError::Internal(format!("Anvil returned an invalid replay expiry: {error}"))
+            })?;
+        Ok(MutateTuplesResult {
+            revision: AuthzRevision(response.revision),
+            replayed: response.replayed,
+            replay_guarantee_expires_at,
         })
     }
 
-    async fn read_tuples(
-        &self,
-        scope: &AuthzScope,
-        object: Option<Object>,
-        relation: Option<String>,
-        subject: Option<Subject>,
-    ) -> Result<Vec<Tuple>, RebacError> {
-        self.read_tuples_with_consistency(
-            scope,
-            object,
-            relation,
-            subject,
-            AnvilConsistency::Latest,
-        )
-        .await
-        .map(|(tuples, _)| tuples)
+    async fn read_tuples(&self, request: ReadTuplesRequest) -> Result<ReadTuplesPage, RebacError> {
+        self.validate_scope(&request.scope)?;
+        if request.page_size > MAX_PAGE_SIZE {
+            return Err(RebacError::ResourceExhausted(format!(
+                "tuple page size exceeds the {MAX_PAGE_SIZE} item limit"
+            )));
+        }
+        let response = self
+            .session
+            .client()
+            .await?
+            .read_tuples(ProtoReadTuplesRequest {
+                scope: Some(scope_to_proto(&request.scope)),
+                filter: Some(tuple_filter_to_proto(request.filter)),
+                consistency: Some(consistency_to_proto(request.consistency)),
+                page_size: request.page_size,
+                page_token: request.page_token.unwrap_or_default(),
+            })
+            .await
+            .map_err(|status| map_read_status(status, &request.scope))?
+            .into_inner();
+        let tuples = response
+            .tuples
+            .into_iter()
+            .map(tuple_from_proto)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ReadTuplesPage {
+            tuples,
+            revision: AuthzRevision(response.revision),
+            next_page_token: (!response.next_page_token.is_empty())
+                .then_some(response.next_page_token),
+        })
     }
 
     async fn check(
         &self,
         scope: &AuthzScope,
-        subject: &Subject,
-        relation: &str,
-        object: &Object,
+        request: CheckRequest,
+        consistency: Consistency,
     ) -> Result<CheckDecision, RebacError> {
-        let binding = self.get_schema_binding(scope).await?;
-        self.check_with_consistency(scope, subject, relation, object, AnvilConsistency::Latest)
-            .await
-            .map(|(allowed, token)| CheckDecision {
-                allowed,
-                metadata: AuthzDecisionMetadata {
-                    scope: scope.clone(),
-                    schema_ref: binding.schema_ref,
-                    authz_revision: token.revision,
-                    zookie: token.zookie,
-                },
+        self.validate_scope(scope)?;
+        let response = self
+            .session
+            .client()
+            .await?
+            .check_permission(CheckPermissionRequest {
+                scope: Some(scope_to_proto(scope)),
+                check: Some(check_to_proto(request)?),
+                consistency: Some(consistency_to_proto(consistency)),
             })
+            .await
+            .map_err(|status| map_check_status(status, scope))?
+            .into_inner();
+        Ok(CheckDecision {
+            allowed: response.allowed,
+            revision: AuthzRevision(response.revision),
+        })
     }
 
     async fn check_many(
         &self,
         scope: &AuthzScope,
         requests: Vec<CheckRequest>,
-    ) -> Result<Vec<CheckDecision>, RebacError> {
-        let binding = self.get_schema_binding(scope).await?;
-        let schema = self
-            .schema_for_ref(&scope.anvil_storage_tenant_id, &binding.schema_ref)
-            .await?;
-        let tuples = self.read_tuples(scope, None, None, None).await?;
-        let view = TupleView::new(tuples);
-        Ok(requests
-            .into_iter()
-            .map(|request| CheckDecision {
-                allowed: view.check(
-                    &schema,
-                    &request.object,
-                    &request.relation,
-                    &request.subject,
-                ),
-                metadata: AuthzDecisionMetadata {
-                    scope: scope.clone(),
-                    schema_ref: binding.schema_ref.clone(),
-                    authz_revision: 0,
-                    zookie: String::new(),
-                },
-            })
-            .collect())
-    }
-
-    async fn list_objects(
-        &self,
-        scope: &AuthzScope,
-        subject: &Subject,
-        relation: &str,
-        object_namespace: &str,
-    ) -> Result<ListObjectsResult, RebacError> {
-        let binding = self.get_schema_binding(scope).await?;
-        let schema = self
-            .schema_for_ref(&scope.anvil_storage_tenant_id, &binding.schema_ref)
-            .await?;
-        let tuples = self.read_tuples(scope, None, None, None).await?;
-        let view = TupleView::new(tuples);
-        Ok(ListObjectsResult {
-            object_ids: view.list_objects(&schema, subject, relation, object_namespace),
-            metadata: AuthzDecisionMetadata {
-                scope: scope.clone(),
-                schema_ref: binding.schema_ref,
-                authz_revision: 0,
-                zookie: String::new(),
-            },
-        })
-    }
-
-    async fn list_subjects(
-        &self,
-        scope: &AuthzScope,
-        object: &Object,
-        relation: &str,
-        subject_namespace: &str,
-    ) -> Result<ListSubjectsResult, RebacError> {
-        let binding = self.get_schema_binding(scope).await?;
-        let schema = self
-            .schema_for_ref(&scope.anvil_storage_tenant_id, &binding.schema_ref)
-            .await?;
-        let tuples = self.read_tuples(scope, None, None, None).await?;
-        let view = TupleView::new(tuples);
-        Ok(ListSubjectsResult {
-            subject_ids: view.list_subjects(&schema, object, relation, subject_namespace),
-            metadata: AuthzDecisionMetadata {
-                scope: scope.clone(),
-                schema_ref: binding.schema_ref,
-                authz_revision: 0,
-                zookie: String::new(),
-            },
-        })
-    }
-}
-
-impl AnvilRebacEngine {
-    async fn schema_for_ref(
-        &self,
-        storage_tenant: &AnvilStorageTenantId,
-        schema_ref: &SchemaRef,
-    ) -> Result<Schema, RebacError> {
-        let key = (
-            storage_tenant.0.clone(),
-            schema_ref.schema_id.0.clone(),
-            schema_ref.schema_revision.0,
-        );
-        if let Some(schema) = self.schemas.read().await.get(&key).cloned() {
-            return Ok(schema);
+        consistency: Consistency,
+    ) -> Result<CheckManyResult, RebacError> {
+        self.validate_scope(scope)?;
+        if requests.is_empty() {
+            return Err(RebacError::InvalidTuple(
+                "permission check batch must not be empty".into(),
+            ));
         }
+        if requests.len() > MAX_CHECKS {
+            return Err(RebacError::ResourceExhausted(format!(
+                "permission check batch exceeds the {MAX_CHECKS} item limit"
+            )));
+        }
+        let expected_results = requests.len();
+        let checks = requests
+            .into_iter()
+            .map(check_to_proto)
+            .collect::<Result<Vec<_>, _>>()?;
         let response = self
-            .client
-            .auth()
-            .get_authz_schema(proto::GetAuthzSchemaRequest {
-                namespace: String::new(),
-                anvil_storage_tenant_id: storage_tenant.0.clone(),
-                schema_id: schema_ref.schema_id.0.clone(),
-                schema_revision: Some(schema_ref.schema_revision.0),
+            .session
+            .client()
+            .await?
+            .check_permissions(CheckPermissionsRequest {
+                scope: Some(scope_to_proto(scope)),
+                checks,
+                consistency: Some(consistency_to_proto(consistency)),
             })
             .await
-            .map_err(anvil_status)?
+            .map_err(|status| map_check_status(status, scope))?
             .into_inner();
-        let schema = schema_from_proto_namespaces(response.namespaces)?;
-        self.schemas.write().await.insert(key, schema.clone());
-        Ok(schema)
+        if response.results.len() != expected_results {
+            return Err(RebacError::Internal(format!(
+                "Anvil returned {} permission results for {expected_results} checks",
+                response.results.len()
+            )));
+        }
+        Ok(CheckManyResult {
+            decisions: response
+                .results
+                .into_iter()
+                .map(|result| result.allowed)
+                .collect(),
+            revision: AuthzRevision(response.revision),
+        })
     }
 }
 
-fn scope_to_proto(scope: &AuthzScope) -> proto::AuthzScope {
-    proto::AuthzScope {
-        anvil_storage_tenant_id: scope.anvil_storage_tenant_id.0.clone(),
-        authz_realm_id: scope.authz_realm_id.0.clone(),
+fn validate_config(config: &AnvilRebacConfig) -> Result<(), RebacError> {
+    for (name, value) in [
+        ("endpoint", config.endpoint.as_str()),
+        ("storage tenant", config.storage_tenant.0.as_str()),
+        ("client ID", config.client_id.as_str()),
+        ("client secret", config.client_secret.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(RebacError::Anvil(format!("Anvil {name} cannot be empty")));
+        }
+    }
+    Ok(())
+}
+
+fn scope_to_proto(scope: &AuthzScope) -> ProtoScope {
+    ProtoScope {
+        storage_tenant: scope.anvil_storage_tenant_id.0.clone(),
+        realm: scope.authz_realm_id.0.clone(),
     }
 }
 
-fn schema_ref_to_proto(schema_ref: &SchemaRef) -> proto::AuthzSchemaRef {
-    proto::AuthzSchemaRef {
+fn scope_from_proto(scope: ProtoScope) -> AuthzScope {
+    AuthzScope::new(scope.storage_tenant, scope.realm)
+}
+
+fn schema_ref_to_proto(schema_ref: &SchemaRef) -> ProtoSchemaRef {
+    ProtoSchemaRef {
         schema_id: schema_ref.schema_id.0.clone(),
         schema_revision: schema_ref.schema_revision.0,
-        schema_digest: schema_ref.schema_digest.clone(),
+        schema_digest: schema_ref.schema_digest.to_vec(),
     }
 }
 
-fn schema_ref_from_proto(schema_ref: proto::AuthzSchemaRef) -> SchemaRef {
-    SchemaRef {
+fn schema_ref_from_proto(schema_ref: ProtoSchemaRef) -> Result<SchemaRef, RebacError> {
+    let digest = schema_ref
+        .schema_digest
+        .try_into()
+        .map_err(|value: Vec<u8>| {
+            RebacError::Internal(format!(
+                "Anvil returned a schema digest with {} bytes instead of 32",
+                value.len()
+            ))
+        })?;
+    Ok(SchemaRef {
         schema_id: SchemaId(schema_ref.schema_id),
         schema_revision: SchemaRevision(schema_ref.schema_revision),
-        schema_digest: schema_ref.schema_digest,
+        schema_digest: digest,
+    })
+}
+
+fn binding_from_proto(binding: ProtoSchemaBinding) -> Result<SchemaBinding, RebacError> {
+    let scope = binding
+        .scope
+        .ok_or_else(|| RebacError::Internal("Anvil binding omitted its scope".into()))?;
+    let schema_ref = binding
+        .schema_ref
+        .ok_or_else(|| RebacError::Internal("Anvil binding omitted its schema reference".into()))?;
+    Ok(SchemaBinding {
+        scope: scope_from_proto(scope),
+        schema_ref: schema_ref_from_proto(schema_ref)?,
+        binding_generation: BindingGeneration(binding.generation),
+    })
+}
+
+fn object_to_proto(object: Object) -> ObjectRef {
+    ObjectRef {
+        namespace: object.namespace,
+        id: Some(Id::OpaqueId(object.id)),
     }
 }
 
-#[derive(Debug)]
-struct EncodedSubject {
-    subject_kind: String,
-    subject_id: String,
+fn object_from_proto(object: ObjectRef) -> Result<Object, RebacError> {
+    match object.id {
+        Some(Id::OpaqueId(id)) => Ok(Object {
+            namespace: object.namespace,
+            id,
+        }),
+        Some(Id::ExactPath(_)) => Err(RebacError::Internal(
+            "Anvil returned an exact-path object that this Zanzibar model cannot represent".into(),
+        )),
+        None => Err(RebacError::Internal(
+            "Anvil authorization object omitted its ID".into(),
+        )),
+    }
 }
 
-fn tuple_update_to_mutation(update: TupleUpdate) -> Result<proto::AuthzTupleMutation, RebacError> {
-    let (tuple, operation) = match update {
-        TupleUpdate::Write(tuple) => (tuple, "add"),
-        TupleUpdate::Delete(tuple) => (tuple, "remove"),
+fn subject_to_proto(subject: Subject) -> ProtoSubject {
+    let kind = match subject {
+        Subject::Entity(object) => SubjectKind::Object(object_to_proto(object)),
+        Subject::Userset { object, relation } => SubjectKind::Userset(Userset {
+            object: Some(object_to_proto(object)),
+            relation,
+        }),
+        Subject::Public => SubjectKind::Object(ObjectRef {
+            namespace: ANVIL_PUBLIC_NAMESPACE.into(),
+            id: Some(Id::OpaqueId(ANVIL_PUBLIC_ID.into())),
+        }),
     };
-    let subject = encode_subject(&tuple.subject)?;
-    Ok(proto::AuthzTupleMutation {
-        namespace: tuple.object.namespace,
-        object_id: tuple.object.id,
+    ProtoSubject { kind: Some(kind) }
+}
+
+fn subject_from_proto(subject: ProtoSubject) -> Result<Subject, RebacError> {
+    match subject.kind {
+        Some(SubjectKind::Object(object))
+            if object.namespace == ANVIL_PUBLIC_NAMESPACE
+                && object.id.as_ref().is_some_and(
+                    |id| matches!(id, Id::OpaqueId(value) if value == ANVIL_PUBLIC_ID),
+                ) =>
+        {
+            Ok(Subject::Public)
+        }
+        Some(SubjectKind::Object(object)) => object_from_proto(object).map(Subject::Entity),
+        Some(SubjectKind::Userset(userset)) => {
+            let object = userset.object.ok_or_else(|| {
+                RebacError::Internal("Anvil userset subject omitted its object".into())
+            })?;
+            Ok(Subject::Userset {
+                object: object_from_proto(object)?,
+                relation: userset.relation,
+            })
+        }
+        None => Err(RebacError::Internal(
+            "Anvil authorization subject omitted its kind".into(),
+        )),
+    }
+}
+
+fn tuple_to_proto(tuple: Tuple) -> RelationTuple {
+    RelationTuple {
+        object: Some(object_to_proto(tuple.object)),
         relation: tuple.relation,
-        subject_kind: subject.subject_kind,
-        subject_id: subject.subject_id,
-        caveat_hash: String::new(),
-        operation: operation.to_string(),
-        reason: "zanzibar tuple update".to_string(),
-        scope: None,
-    })
+        subject: Some(subject_to_proto(tuple.subject)),
+    }
 }
 
-fn encode_subject(subject: &Subject) -> Result<EncodedSubject, RebacError> {
-    Ok(match subject {
-        Subject::Entity(object) => EncodedSubject {
-            subject_kind: object.namespace.clone(),
-            subject_id: object.id.clone(),
-        },
-        Subject::Userset { object, relation } => EncodedSubject {
-            subject_kind: "userset".to_string(),
-            subject_id: encode_userset_subject(object, relation),
-        },
-    })
-}
-
-fn tuple_from_proto(tuple: proto::AuthzTuple) -> Result<Tuple, RebacError> {
+fn tuple_from_proto(tuple: RelationTuple) -> Result<Tuple, RebacError> {
+    let object = tuple.object.ok_or_else(|| {
+        RebacError::Internal("Anvil authorization tuple omitted its object".into())
+    })?;
+    let subject = tuple.subject.ok_or_else(|| {
+        RebacError::Internal("Anvil authorization tuple omitted its subject".into())
+    })?;
     Ok(Tuple {
-        object: Object {
-            namespace: tuple.namespace,
-            id: tuple.object_id,
-        },
+        object: object_from_proto(object)?,
         relation: tuple.relation,
-        subject: decode_subject(&tuple.subject_kind, &tuple.subject_id)?,
+        subject: subject_from_proto(subject)?,
     })
 }
 
-fn decode_subject(subject_kind: &str, subject_id: &str) -> Result<Subject, RebacError> {
-    if subject_kind == "userset" {
-        let (object, relation) = decode_userset_subject(subject_id)?;
-        Ok(Subject::Userset { object, relation })
-    } else {
-        Ok(Subject::Entity(Object {
-            namespace: subject_kind.to_string(),
-            id: subject_id.to_string(),
-        }))
+fn tuple_update_to_proto(update: TupleUpdate) -> Result<ProtoTupleMutation, RebacError> {
+    let operation = match update {
+        TupleUpdate::Add(tuple) => Operation::Add(tuple_to_proto(tuple)),
+        TupleUpdate::Remove(tuple) => Operation::Remove(tuple_to_proto(tuple)),
+    };
+    Ok(ProtoTupleMutation {
+        operation: Some(operation),
+    })
+}
+
+fn tuple_filter_to_proto(filter: TupleFilter) -> ProtoTupleFilter {
+    let object = filter.object.map(|filter| ProtoObjectFilter {
+        selection: Some(match filter {
+            ObjectFilter::Namespace(namespace) => Selection::Namespace(namespace),
+            ObjectFilter::Exact(object) => Selection::Exact(object_to_proto(object)),
+        }),
+    });
+    ProtoTupleFilter {
+        object,
+        relation: filter.relation,
+        subject: filter.subject.map(subject_to_proto),
     }
 }
 
-fn encode_userset_subject(object: &Object, relation: &str) -> String {
-    format!("{}/{}#{}", object.namespace, object.id, relation)
+fn consistency_to_proto(consistency: Consistency) -> ProtoConsistency {
+    let requirement = match consistency {
+        Consistency::Latest => Requirement::Latest(LatestConsistency {}),
+        Consistency::AtLeast(revision) => Requirement::AtLeast(AtLeastRevision {
+            revision: revision.0,
+        }),
+        Consistency::Exact(revision) => Requirement::Exact(ExactRevision {
+            revision: revision.0,
+        }),
+    };
+    ProtoConsistency {
+        requirement: Some(requirement),
+    }
 }
 
-fn decode_userset_subject(value: &str) -> Result<(Object, String), RebacError> {
-    let Some((namespace, rest)) = value.split_once('/') else {
-        return Err(RebacError::Internal("invalid userset subject".to_string()));
-    };
-    let Some((object_id, relation)) = rest.rsplit_once('#') else {
-        return Err(RebacError::Internal("invalid userset subject".to_string()));
-    };
-    Ok((
-        Object {
-            namespace: namespace.to_string(),
-            id: object_id.to_string(),
-        },
-        relation.to_string(),
-    ))
+fn check_to_proto(request: CheckRequest) -> Result<PermissionCheck, RebacError> {
+    if matches!(request.subject, Subject::Userset { .. }) {
+        return Err(RebacError::InvalidTuple(
+            "permission checks require an entity or public subject, not a userset".into(),
+        ));
+    }
+    Ok(PermissionCheck {
+        subject: Some(subject_to_proto(request.subject)),
+        object: Some(object_to_proto(request.object)),
+        relation: request.relation,
+    })
 }
 
-fn schema_to_proto_namespaces(
-    schema: &Schema,
-) -> Result<Vec<proto::AuthzNamespaceSchema>, RebacError> {
-    let schema_json = serde_json::to_string(schema)
-        .map_err(|err| RebacError::Internal(format!("encode schema: {err}")))?;
+fn schema_to_proto(schema: &Schema) -> Result<Vec<ProtoNamespaceDefinition>, RebacError> {
     let mut namespaces = schema
         .namespaces
         .iter()
-        .map(|(namespace, config)| proto::AuthzNamespaceSchema {
-            namespace: namespace.clone(),
-            relations: config
-                .rules
+        .map(|(name, namespace)| {
+            validate_component(name, "namespace")?;
+            let mut relations = namespace
+                .relations
                 .iter()
-                .map(|(relation, rules)| proto::AuthzRelationSchema {
-                    relation: relation.clone(),
-                    rules: rules.iter().map(relation_rule_to_proto).collect(),
+                .map(|(name, definition)| {
+                    validate_component(name, "relation")?;
+                    Ok(ProtoRelationDefinition {
+                        name: name.clone(),
+                        kind: Some(relation_to_proto(definition.clone())?),
+                    })
                 })
-                .collect(),
-            schema_json: schema_json.clone(),
-            schema_hash: String::new(),
-            schema_version: 0,
-            authz_revision: 0,
-            applied_at: String::new(),
+                .collect::<Result<Vec<_>, RebacError>>()?;
+            relations.sort_by(|left, right| left.name.cmp(&right.name));
+            Ok(ProtoNamespaceDefinition {
+                name: name.clone(),
+                relations,
+            })
         })
-        .collect::<Vec<_>>();
-    namespaces.sort_by(|left, right| left.namespace.cmp(&right.namespace));
+        .collect::<Result<Vec<_>, RebacError>>()?;
+    namespaces.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(namespaces)
 }
 
-fn relation_rule_to_proto(rule: &RelationRule) -> proto::AuthzRelationRule {
-    match rule {
-        RelationRule::Inherit(relation) => proto::AuthzRelationRule {
-            kind: "inherit".to_string(),
-            relation: relation.clone(),
-            tuple_relation: String::new(),
-            target_relation: String::new(),
-        },
-        RelationRule::Computed {
-            tuple_relation,
-            target_relation,
-        } => proto::AuthzRelationRule {
-            kind: "computed".to_string(),
-            relation: String::new(),
-            tuple_relation: tuple_relation.clone(),
-            target_relation: target_relation.clone(),
-        },
-        RelationRule::TupleToUserset {
-            tuple_relation,
-            target_relation,
-        } => proto::AuthzRelationRule {
-            kind: "tuple_to_userset".to_string(),
-            relation: String::new(),
-            tuple_relation: tuple_relation.clone(),
-            target_relation: target_relation.clone(),
-        },
+fn relation_to_proto(definition: RelationDefinition) -> Result<RelationKind, RebacError> {
+    match definition {
+        RelationDefinition::Direct { allowed_subjects } => {
+            if allowed_subjects.is_empty() {
+                return Err(RebacError::InvalidSchema(
+                    "a direct relation must allow at least one subject selector".into(),
+                ));
+            }
+            Ok(RelationKind::Direct(DirectRelation {
+                allowed_subjects: allowed_subjects
+                    .into_iter()
+                    .map(selector_to_proto)
+                    .collect::<Result<Vec<_>, _>>()?,
+            }))
+        }
+        RelationDefinition::Permission { rules } => {
+            if rules.is_empty() {
+                return Err(RebacError::InvalidSchema(
+                    "a permission must contain at least one rule".into(),
+                ));
+            }
+            Ok(RelationKind::Permission(Permission {
+                rules: rules
+                    .into_iter()
+                    .map(rule_to_proto)
+                    .collect::<Result<Vec<_>, _>>()?,
+            }))
+        }
     }
 }
 
-fn schema_from_proto_namespaces(
-    namespaces: Vec<proto::AuthzNamespaceSchema>,
-) -> Result<Schema, RebacError> {
+fn selector_to_proto(selector: SubjectSelector) -> Result<ProtoSubjectSelector, RebacError> {
+    let selector = match selector {
+        SubjectSelector::AnyObject { namespace } => {
+            validate_component(&namespace, "subject namespace")?;
+            Selector::AnyObject(AnyObjectSelector { namespace })
+        }
+        SubjectSelector::AnyUserset {
+            namespace,
+            relation,
+        } => {
+            validate_component(&namespace, "subject namespace")?;
+            validate_component(&relation, "userset relation")?;
+            Selector::AnyUserset(AnyUsersetSelector {
+                namespace,
+                relation,
+            })
+        }
+        SubjectSelector::Exact(subject) => Selector::Exact(subject_to_proto(subject)),
+        SubjectSelector::SameResourceId { namespace } => {
+            validate_component(&namespace, "subject namespace")?;
+            Selector::SameResourceId(SameResourceIdSelector { namespace })
+        }
+        SubjectSelector::Public => Selector::Public(PublicSubjectSelector {}),
+    };
+    Ok(ProtoSubjectSelector {
+        selector: Some(selector),
+    })
+}
+
+fn rule_to_proto(rule: PermissionRule) -> Result<ProtoPermissionRule, RebacError> {
+    let rule = match rule {
+        PermissionRule::Inherit { relation } => {
+            validate_component(&relation, "inherited relation")?;
+            Rule::Inherit(InheritRule { relation })
+        }
+        PermissionRule::TupleToUserset {
+            tuple_relation,
+            target_relation,
+        } => {
+            validate_component(&tuple_relation, "tuple relation")?;
+            validate_component(&target_relation, "target relation")?;
+            Rule::TupleToUserset(TupleToUsersetRule {
+                tuple_relation,
+                target_relation,
+            })
+        }
+    };
+    Ok(ProtoPermissionRule { rule: Some(rule) })
+}
+
+fn schema_from_proto(namespaces: Vec<ProtoNamespaceDefinition>) -> Result<Schema, RebacError> {
     let mut schema = Schema::default();
     for namespace in namespaces {
-        if !namespace.schema_json.is_empty() {
-            let stored_schema: Schema = serde_json::from_str(&namespace.schema_json)
-                .map_err(|err| RebacError::Internal(format!("decode schema: {err}")))?;
-            if let Some(config) = stored_schema.namespaces.get(&namespace.namespace) {
-                schema
-                    .namespaces
-                    .insert(namespace.namespace.clone(), config.clone());
-                continue;
-            }
+        let mut relations = std::collections::HashMap::new();
+        for relation in namespace.relations {
+            let definition = relation_from_proto(relation.kind.ok_or_else(|| {
+                RebacError::Internal("Anvil schema relation omitted its kind".into())
+            })?)?;
+            relations.insert(relation.name, definition);
         }
-        schema.namespaces.insert(
-            namespace.namespace,
-            NamespaceConfig {
-                rules: namespace
-                    .relations
-                    .into_iter()
-                    .map(|relation| {
-                        Ok((
-                            relation.relation,
-                            relation
-                                .rules
-                                .into_iter()
-                                .map(relation_rule_from_proto)
-                                .collect::<Result<Vec<_>, _>>()?,
-                        ))
-                    })
-                    .collect::<Result<HashMap<_, _>, RebacError>>()?,
-            },
-        );
+        schema
+            .namespaces
+            .insert(namespace.name, NamespaceDefinition { relations });
     }
     Ok(schema)
 }
 
-fn relation_rule_from_proto(rule: proto::AuthzRelationRule) -> Result<RelationRule, RebacError> {
-    match rule.kind.as_str() {
-        "inherit" => Ok(RelationRule::Inherit(rule.relation)),
-        "computed" => Ok(RelationRule::Computed {
-            tuple_relation: rule.tuple_relation,
-            target_relation: rule.target_relation,
+fn relation_from_proto(kind: RelationKind) -> Result<RelationDefinition, RebacError> {
+    match kind {
+        RelationKind::Direct(direct) => Ok(RelationDefinition::Direct {
+            allowed_subjects: direct
+                .allowed_subjects
+                .into_iter()
+                .map(selector_from_proto)
+                .collect::<Result<BTreeSet<_>, _>>()?,
         }),
-        "tuple_to_userset" => Ok(RelationRule::TupleToUserset {
-            tuple_relation: rule.tuple_relation,
-            target_relation: rule.target_relation,
+        RelationKind::Permission(permission) => Ok(RelationDefinition::Permission {
+            rules: permission
+                .rules
+                .into_iter()
+                .map(rule_from_proto)
+                .collect::<Result<BTreeSet<_>, _>>()?,
         }),
-        other => Err(RebacError::Internal(format!(
-            "unsupported Anvil authz schema rule kind: {other}"
-        ))),
     }
 }
 
-fn validate_schema(schema: &Schema) -> Result<(), RebacError> {
-    for (namespace, config) in &schema.namespaces {
-        validate_component(namespace, "namespace")?;
-        for (relation, rules) in &config.rules {
-            validate_component(relation, "relation")?;
-            for rule in rules {
-                match rule {
-                    RelationRule::Inherit(relation) => validate_component(relation, "relation")?,
-                    RelationRule::Computed {
-                        tuple_relation,
-                        target_relation,
-                    }
-                    | RelationRule::TupleToUserset {
-                        tuple_relation,
-                        target_relation,
-                    } => {
-                        validate_component(tuple_relation, "tuple relation")?;
-                        validate_component(target_relation, "target relation")?;
-                    }
-                }
-            }
-        }
+fn selector_from_proto(selector: ProtoSubjectSelector) -> Result<SubjectSelector, RebacError> {
+    match selector.selector {
+        Some(Selector::AnyObject(selector)) => Ok(SubjectSelector::AnyObject {
+            namespace: selector.namespace,
+        }),
+        Some(Selector::AnyUserset(selector)) => Ok(SubjectSelector::AnyUserset {
+            namespace: selector.namespace,
+            relation: selector.relation,
+        }),
+        Some(Selector::Exact(subject)) => subject_from_proto(subject).map(SubjectSelector::Exact),
+        Some(Selector::SameResourceId(selector)) => Ok(SubjectSelector::SameResourceId {
+            namespace: selector.namespace,
+        }),
+        Some(Selector::Public(_)) => Ok(SubjectSelector::Public),
+        None => Err(RebacError::Internal(
+            "Anvil schema subject selector omitted its kind".into(),
+        )),
     }
-    Ok(())
+}
+
+fn rule_from_proto(rule: ProtoPermissionRule) -> Result<PermissionRule, RebacError> {
+    match rule.rule {
+        Some(Rule::Inherit(rule)) => Ok(PermissionRule::Inherit {
+            relation: rule.relation,
+        }),
+        Some(Rule::TupleToUserset(rule)) => Ok(PermissionRule::TupleToUserset {
+            tuple_relation: rule.tuple_relation,
+            target_relation: rule.target_relation,
+        }),
+        None => Err(RebacError::Internal(
+            "Anvil schema permission rule omitted its kind".into(),
+        )),
+    }
 }
 
 fn validate_component(value: &str, name: &str) -> Result<(), RebacError> {
@@ -722,387 +868,340 @@ fn validate_component(value: &str, name: &str) -> Result<(), RebacError> {
         || value.contains('/')
         || value.chars().any(char::is_control)
     {
-        Err(RebacError::Internal(format!(
-            "invalid Anvil Zanzibar {name}: {value:?}"
-        )))
-    } else {
-        Ok(())
+        return Err(RebacError::InvalidSchema(format!(
+            "invalid {name}: {value:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn map_schema_status(status: Status, schema_id: &SchemaId) -> RebacError {
+    match status.code() {
+        Code::NotFound => RebacError::SchemaNotFound(schema_id.0.clone()),
+        Code::InvalidArgument => RebacError::InvalidSchema(status.message().into()),
+        _ => map_status(status),
     }
 }
 
-fn anvil_status(status: tonic::Status) -> RebacError {
-    RebacError::Internal(format!("Anvil request failed: {status}"))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct NodeKey {
-    namespace: String,
-    object_id: String,
-    relation: String,
-}
-
-impl NodeKey {
-    fn new(object: &Object, relation: &str) -> Self {
-        Self {
-            namespace: object.namespace.clone(),
-            object_id: object.id.clone(),
-            relation: relation.to_string(),
-        }
-    }
-
-    fn object(&self) -> Object {
-        Object {
-            namespace: self.namespace.clone(),
-            id: self.object_id.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct TupleView {
-    tuples: Vec<Tuple>,
-}
-
-impl TupleView {
-    fn new(tuples: Vec<Tuple>) -> Self {
-        Self { tuples }
-    }
-
-    fn check(&self, schema: &Schema, object: &Object, relation: &str, subject: &Subject) -> bool {
-        self.check_node(
-            schema,
-            &NodeKey::new(object, relation),
-            subject,
-            &mut HashSet::new(),
-        )
-    }
-
-    fn list_objects(
-        &self,
-        schema: &Schema,
-        subject: &Subject,
-        relation: &str,
-        object_namespace: &str,
-    ) -> Vec<String> {
-        self.tuples
-            .iter()
-            .filter(|tuple| tuple.object.namespace == object_namespace)
-            .map(|tuple| tuple.object.id.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .filter(|object_id| {
-                self.check(
-                    schema,
-                    &Object {
-                        namespace: object_namespace.to_string(),
-                        id: object_id.clone(),
-                    },
-                    relation,
-                    subject,
-                )
-            })
-            .collect()
-    }
-
-    fn list_subjects(
-        &self,
-        schema: &Schema,
-        object: &Object,
-        relation: &str,
-        subject_namespace: &str,
-    ) -> Vec<String> {
-        self.tuples
-            .iter()
-            .filter_map(|tuple| match &tuple.subject {
-                Subject::Entity(subject) if subject.namespace == subject_namespace => {
-                    Some(subject.id.clone())
-                }
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .filter(|subject_id| {
-                self.check(
-                    schema,
-                    object,
-                    relation,
-                    &Subject::Entity(Object {
-                        namespace: subject_namespace.to_string(),
-                        id: subject_id.clone(),
-                    }),
-                )
-            })
-            .collect()
-    }
-
-    fn check_node(
-        &self,
-        schema: &Schema,
-        node: &NodeKey,
-        subject: &Subject,
-        visited: &mut HashSet<NodeKey>,
-    ) -> bool {
-        if !visited.insert(node.clone()) {
-            return false;
-        }
-
-        if subject_matches_node(subject, node) {
-            visited.remove(node);
-            return true;
-        }
-
-        for tuple in self.tuples_for_node(node) {
-            if subject_matches(&tuple.subject, subject)
-                || match &tuple.subject {
-                    Subject::Userset { object, relation } => {
-                        self.check_node(schema, &NodeKey::new(object, relation), subject, visited)
-                    }
-                    Subject::Entity(_) => false,
-                }
-            {
-                visited.remove(node);
-                return true;
+fn map_binding_status(
+    status: Status,
+    schema_id: &SchemaId,
+    expected: Option<BindingGeneration>,
+) -> RebacError {
+    match status.code() {
+        Code::NotFound => RebacError::SchemaNotFound(schema_id.0.clone()),
+        Code::Aborted if status.message().contains("binding generation") => {
+            RebacError::SchemaBindingGenerationConflict {
+                expected,
+                actual: binding_generation_from_message(status.message()).map(BindingGeneration),
             }
         }
-
-        if let Some(namespace) = schema.namespaces.get(&node.namespace)
-            && let Some(rules) = namespace.rules.get(&node.relation)
-        {
-            let object = node.object();
-            for rule in rules {
-                match rule {
-                    RelationRule::Inherit(inherited_relation) => {
-                        if self.check_node(
-                            schema,
-                            &NodeKey::new(&object, inherited_relation),
-                            subject,
-                            visited,
-                        ) {
-                            visited.remove(node);
-                            return true;
-                        }
-                    }
-                    RelationRule::Computed {
-                        tuple_relation,
-                        target_relation,
-                    }
-                    | RelationRule::TupleToUserset {
-                        tuple_relation,
-                        target_relation,
-                    } => {
-                        let source_node = NodeKey::new(&object, tuple_relation);
-                        for tuple in self.tuples_for_node(&source_node) {
-                            let target_object = match &tuple.subject {
-                                Subject::Entity(object) | Subject::Userset { object, .. } => object,
-                            };
-                            if self.check_node(
-                                schema,
-                                &NodeKey::new(target_object, target_relation),
-                                subject,
-                                visited,
-                            ) {
-                                visited.remove(node);
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
+        Code::Aborted | Code::FailedPrecondition => {
+            RebacError::SchemaBindingRejected(status.message().into())
         }
-
-        visited.remove(node);
-        false
-    }
-
-    fn tuples_for_node<'a>(&'a self, node: &'a NodeKey) -> impl Iterator<Item = &'a Tuple> + 'a {
-        self.tuples.iter().filter(move |tuple| {
-            tuple.object.namespace == node.namespace
-                && tuple.object.id == node.object_id
-                && tuple.relation == node.relation
-        })
+        _ => map_status(status),
     }
 }
 
-fn subject_matches(left: &Subject, right: &Subject) -> bool {
-    match (left, right) {
-        (Subject::Entity(left), Subject::Entity(right)) => object_matches(left, right),
-        (
-            Subject::Userset {
-                object: left_object,
-                relation: left_relation,
-            },
-            Subject::Userset {
-                object: right_object,
-                relation: right_relation,
-            },
-        ) => object_matches(left_object, right_object) && left_relation == right_relation,
-        _ => false,
-    }
+fn binding_generation_from_message(message: &str) -> Option<u64> {
+    ["actual ", "current "].into_iter().find_map(|marker| {
+        let value = message.split(marker).nth(1)?;
+        let digits = value
+            .trim_start_matches(|character: char| !character.is_ascii_digit())
+            .split(|character: char| !character.is_ascii_digit())
+            .next()?;
+        digits.parse().ok()
+    })
 }
 
-fn subject_matches_node(subject: &Subject, node: &NodeKey) -> bool {
-    match subject {
-        Subject::Userset { object, relation } => {
-            object_matches(
-                object,
-                &Object {
-                    namespace: node.namespace.clone(),
-                    id: node.object_id.clone(),
-                },
-            ) && relation == &node.relation
+fn map_mutation_status(status: Status, scope: &AuthzScope) -> RebacError {
+    match status.code() {
+        Code::NotFound => RebacError::SchemaBindingNotFound(scope.clone()),
+        Code::FailedPrecondition if status.message().contains("no schema binding") => {
+            RebacError::SchemaBindingNotFound(scope.clone())
         }
-        Subject::Entity(_) => false,
+        Code::InvalidArgument => RebacError::InvalidMutation(status.message().into()),
+        _ => map_status(status),
     }
 }
 
-fn object_matches(left: &Object, right: &Object) -> bool {
-    (left.namespace == right.namespace || left.namespace == "*" || right.namespace == "*")
-        && (left.id == right.id || left.id == "*" || right.id == "*")
+fn map_read_status(status: Status, scope: &AuthzScope) -> RebacError {
+    match status.code() {
+        Code::NotFound => RebacError::SchemaBindingNotFound(scope.clone()),
+        Code::InvalidArgument => RebacError::InvalidReadRequest(status.message().into()),
+        _ => map_status(status),
+    }
+}
+
+fn map_check_status(status: Status, scope: &AuthzScope) -> RebacError {
+    match status.code() {
+        Code::NotFound => RebacError::SchemaBindingNotFound(scope.clone()),
+        Code::InvalidArgument => RebacError::InvalidTuple(status.message().into()),
+        _ => map_status(status),
+    }
+}
+
+fn map_status(status: Status) -> RebacError {
+    let message = status.message().to_owned();
+    match status.code() {
+        Code::Unauthenticated => RebacError::Unauthenticated(message),
+        Code::PermissionDenied => RebacError::PermissionDenied(message),
+        Code::Aborted | Code::AlreadyExists => RebacError::Conflict(message),
+        Code::FailedPrecondition if message.contains("AUTHZ_REVISION_EXPIRED") => {
+            RebacError::RevisionExpired(message)
+        }
+        Code::FailedPrecondition if message.contains("revision") => {
+            RebacError::RevisionUnavailable(message)
+        }
+        Code::ResourceExhausted => RebacError::ResourceExhausted(message),
+        Code::Unavailable | Code::DeadlineExceeded => RebacError::Unavailable(message),
+        Code::Internal | Code::DataLoss | Code::Unknown => RebacError::Internal(message),
+        _ => RebacError::Anvil(format!("{}: {message}", status.code())),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::SchemaBuilder;
+    use std::collections::{BTreeSet, HashMap};
 
-    fn user(id: &str) -> Subject {
-        Subject::Entity(Object {
-            namespace: "user".to_string(),
-            id: id.to_string(),
-        })
-    }
+    use super::*;
 
     fn object(namespace: &str, id: &str) -> Object {
         Object {
-            namespace: namespace.to_string(),
-            id: id.to_string(),
+            namespace: namespace.into(),
+            id: id.into(),
         }
     }
 
     #[test]
-    fn local_evaluator_handles_inherit_and_nested_usersets() {
-        let schema = SchemaBuilder::new()
-            .namespace(
-                "document",
-                NamespaceConfig {
-                    rules: HashMap::from([(
-                        "viewer".to_string(),
-                        vec![RelationRule::Inherit("editor".to_string())],
-                    )]),
-                },
-            )
-            .build();
-        let view = TupleView::new(vec![
-            Tuple {
-                object: object("document", "alpha"),
-                relation: "editor".to_string(),
-                subject: Subject::Userset {
-                    object: object("group", "eng"),
-                    relation: "member".to_string(),
-                },
-            },
-            Tuple {
-                object: object("group", "eng"),
-                relation: "member".to_string(),
-                subject: user("alice"),
-            },
-        ]);
-
-        assert!(view.check(
-            &schema,
-            &object("document", "alpha"),
-            "viewer",
-            &user("alice")
-        ));
-    }
-
-    #[test]
-    fn local_evaluator_handles_computed_usersets_from_entity_subjects() {
-        let schema = SchemaBuilder::new()
-            .namespace(
-                "document",
-                NamespaceConfig {
-                    rules: HashMap::from([(
-                        "viewer".to_string(),
-                        vec![RelationRule::Computed {
-                            tuple_relation: "parent_folder".to_string(),
-                            target_relation: "viewer".to_string(),
-                        }],
-                    )]),
-                },
-            )
-            .namespace(
-                "folder",
-                NamespaceConfig {
-                    rules: HashMap::new(),
-                },
-            )
-            .build();
-        let view = TupleView::new(vec![
-            Tuple {
-                object: object("document", "alpha"),
-                relation: "parent_folder".to_string(),
-                subject: Subject::Entity(object("folder", "platform")),
-            },
-            Tuple {
-                object: object("folder", "platform"),
-                relation: "viewer".to_string(),
-                subject: user("alice"),
-            },
-        ]);
-
-        assert!(view.check(
-            &schema,
-            &object("document", "alpha"),
-            "viewer",
-            &user("alice")
-        ));
-        assert_eq!(
-            view.list_objects(&schema, &user("alice"), "viewer", "document"),
-            vec!["alpha"]
-        );
-    }
-
-    #[test]
-    fn schema_round_trips_through_anvil_proto_shape() {
-        let schema = SchemaBuilder::new()
-            .namespace(
-                "document",
-                NamespaceConfig {
-                    rules: HashMap::from([(
-                        "viewer".to_string(),
-                        vec![
-                            RelationRule::Inherit("editor".to_string()),
-                            RelationRule::TupleToUserset {
-                                tuple_relation: "shared_with".to_string(),
-                                target_relation: "member".to_string(),
-                            },
-                        ],
-                    )]),
-                },
-            )
-            .build();
-        let proto = schema_to_proto_namespaces(&schema).unwrap();
-        let decoded = schema_from_proto_namespaces(proto).unwrap();
-        assert_eq!(decoded.namespaces.len(), schema.namespaces.len());
-        assert_eq!(
-            decoded.namespaces["document"].rules["viewer"],
-            schema.namespaces["document"].rules["viewer"]
-        );
-    }
-
-    #[test]
-    fn userset_subject_round_trips_through_anvil_tuple_shape() {
-        let subject = Subject::Userset {
-            object: object("group", "eng"),
-            relation: "member".to_string(),
+    fn debug_output_redacts_the_client_secret() {
+        let config = AnvilRebacConfig {
+            endpoint: "https://anvil.example".into(),
+            storage_tenant: "tenant-1".into(),
+            client_id: "app-1".into(),
+            client_secret: "do-not-print".into(),
         };
-        let encoded = encode_subject(&subject).unwrap();
-        assert_eq!(encoded.subject_kind, "userset");
-        assert_eq!(encoded.subject_id, "group/eng#member");
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("do-not-print"));
+        assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn entity_userset_and_public_subjects_round_trip() {
+        let subjects = [
+            Subject::Entity(object("user", "alice")),
+            Subject::Userset {
+                object: object("group", "engineering"),
+                relation: "member".into(),
+            },
+            Subject::Public,
+        ];
+        for subject in subjects {
+            let decoded = subject_from_proto(subject_to_proto(subject.clone())).unwrap();
+            assert_eq!(decoded, subject);
+        }
+    }
+
+    #[test]
+    fn schema_round_trips_without_string_encoded_rules() {
+        let schema = Schema {
+            namespaces: HashMap::from([
+                (
+                    "group".into(),
+                    NamespaceDefinition {
+                        relations: HashMap::from([(
+                            "member".into(),
+                            RelationDefinition::Direct {
+                                allowed_subjects: BTreeSet::from([SubjectSelector::AnyObject {
+                                    namespace: "user".into(),
+                                }]),
+                            },
+                        )]),
+                    },
+                ),
+                (
+                    "document".into(),
+                    NamespaceDefinition {
+                        relations: HashMap::from([
+                            (
+                                "reader".into(),
+                                RelationDefinition::Direct {
+                                    allowed_subjects: BTreeSet::from([
+                                        SubjectSelector::AnyObject {
+                                            namespace: "user".into(),
+                                        },
+                                        SubjectSelector::AnyUserset {
+                                            namespace: "group".into(),
+                                            relation: "member".into(),
+                                        },
+                                        SubjectSelector::Public,
+                                    ]),
+                                },
+                            ),
+                            (
+                                "can_read".into(),
+                                RelationDefinition::Permission {
+                                    rules: BTreeSet::from([PermissionRule::Inherit {
+                                        relation: "reader".into(),
+                                    }]),
+                                },
+                            ),
+                        ]),
+                    },
+                ),
+            ]),
+        };
+        let decoded = schema_from_proto(schema_to_proto(&schema).unwrap()).unwrap();
+        assert_eq!(decoded, schema);
+    }
+
+    #[test]
+    fn schema_selectors_and_rules_have_canonical_set_order() {
+        let selectors = BTreeSet::from([
+            SubjectSelector::Public,
+            SubjectSelector::AnyUserset {
+                namespace: "group".into(),
+                relation: "member".into(),
+            },
+            SubjectSelector::AnyObject {
+                namespace: "user".into(),
+            },
+        ]);
+        let same_selectors = [
+            SubjectSelector::AnyObject {
+                namespace: "user".into(),
+            },
+            SubjectSelector::Public,
+            SubjectSelector::AnyUserset {
+                namespace: "group".into(),
+                relation: "member".into(),
+            },
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        assert_eq!(selectors, same_selectors);
         assert_eq!(
-            decode_subject(&encoded.subject_kind, &encoded.subject_id).unwrap(),
-            subject
+            relation_to_proto(RelationDefinition::Direct {
+                allowed_subjects: selectors,
+            })
+            .unwrap(),
+            relation_to_proto(RelationDefinition::Direct {
+                allowed_subjects: same_selectors,
+            })
+            .unwrap()
+        );
+
+        let rules = BTreeSet::from([
+            PermissionRule::TupleToUserset {
+                tuple_relation: "parent".into(),
+                target_relation: "viewer".into(),
+            },
+            PermissionRule::Inherit {
+                relation: "reader".into(),
+            },
+        ]);
+        let same_rules = [
+            PermissionRule::Inherit {
+                relation: "reader".into(),
+            },
+            PermissionRule::TupleToUserset {
+                tuple_relation: "parent".into(),
+                target_relation: "viewer".into(),
+            },
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        assert_eq!(rules, same_rules);
+        assert_eq!(
+            relation_to_proto(RelationDefinition::Permission { rules }).unwrap(),
+            relation_to_proto(RelationDefinition::Permission { rules: same_rules }).unwrap()
+        );
+    }
+
+    #[test]
+    fn tuple_round_trip_preserves_a_typed_userset() {
+        let tuple = Tuple {
+            object: object("document", "roadmap"),
+            relation: "reader".into(),
+            subject: Subject::Userset {
+                object: object("group", "engineering"),
+                relation: "member".into(),
+            },
+        };
+        assert_eq!(
+            tuple_from_proto(tuple_to_proto(tuple.clone())).unwrap(),
+            tuple
+        );
+    }
+
+    #[test]
+    fn exact_and_at_least_consistency_use_numeric_revisions() {
+        assert!(matches!(
+            consistency_to_proto(Consistency::Exact(AuthzRevision(7))).requirement,
+            Some(Requirement::Exact(ExactRevision { revision: 7 }))
+        ));
+        assert!(matches!(
+            consistency_to_proto(Consistency::AtLeast(AuthzRevision(9))).requirement,
+            Some(Requirement::AtLeast(AtLeastRevision { revision: 9 }))
+        ));
+    }
+
+    #[test]
+    fn status_mapping_distinguishes_authz_failures() {
+        assert!(matches!(
+            map_status(Status::unauthenticated("bad token")),
+            RebacError::Unauthenticated(_)
+        ));
+        assert!(matches!(
+            map_status(Status::permission_denied("forbidden")),
+            RebacError::PermissionDenied(_)
+        ));
+        assert!(matches!(
+            map_status(Status::failed_precondition(
+                "AUTHZ_REVISION_EXPIRED: no longer current"
+            )),
+            RebacError::RevisionExpired(_)
+        ));
+        assert!(matches!(
+            map_status(Status::aborted("revision conflict")),
+            RebacError::Conflict(_)
+        ));
+    }
+
+    #[test]
+    fn operation_status_mapping_preserves_missing_schema_and_binding() {
+        let scope = AuthzScope::new("tenant", "realm");
+        let schema_id = SchemaId("missing".into());
+        assert!(matches!(
+            map_binding_status(Status::not_found("schema missing"), &schema_id, None),
+            RebacError::SchemaNotFound(id) if id == "missing"
+        ));
+        assert!(matches!(
+            map_mutation_status(Status::not_found("binding missing"), &scope),
+            RebacError::SchemaBindingNotFound(found) if found == scope
+        ));
+        assert!(matches!(
+            map_mutation_status(
+                Status::failed_precondition("authorization realm has no schema binding"),
+                &scope,
+            ),
+            RebacError::SchemaBindingNotFound(found) if found == scope
+        ));
+        assert!(matches!(
+            map_read_status(Status::not_found("binding missing"), &scope),
+            RebacError::SchemaBindingNotFound(found) if found == scope
+        ));
+        assert!(matches!(
+            map_check_status(Status::not_found("binding missing"), &scope),
+            RebacError::SchemaBindingNotFound(found) if found == scope
+        ));
+    }
+
+    #[test]
+    fn binding_conflict_extracts_the_actual_generation_when_available() {
+        assert_eq!(
+            binding_generation_from_message("expected Some(3), current Some(5)"),
+            Some(5)
         );
     }
 }
