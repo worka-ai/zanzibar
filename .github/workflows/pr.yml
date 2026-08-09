@@ -10,35 +10,47 @@ permissions:
   packages: read
 
 jobs:
-  test:
+  msrv:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: worka
-          POSTGRES_PASSWORD: worka
-          POSTGRES_DB: worka
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install minimum supported Rust
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Check minimum supported Rust
+        run: cargo check --all-targets
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Enforce Rust source file size
+        shell: bash
+        run: |
+          set -euo pipefail
+          oversized=0
+          while IFS= read -r -d '' source; do
+            lines="$(wc -l <"${source}")"
+            if ((lines > 2000)); then
+              printf '%s has %s lines; the limit is 2000\n' "${source}" "${lines}" >&2
+              oversized=1
+            fi
+          done < <(find src tests -type f -name '*.rs' -print0)
+          exit "${oversized}"
+
       - name: Run format check
         run: cargo fmt --check
+
       - name: Run clippy
-        run: cargo clippy --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
       - name: Run tests
         run: cargo test --all-features
 
@@ -49,67 +61,96 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Start latest Anvil for backend tests
+      - name: Start Anvil 0.5.5 and provision an application
         shell: bash
         env:
-          ANVIL_IMAGE: ghcr.io/worka-ai/anvil:latest
-          ANVIL_SECRET_ENCRYPTION_KEY: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-          JWT_SECRET: zanzibar-ci-jwt-secret
+          ANVIL_IMAGE: ghcr.io/worka-ai/anvil:0.5.5
+          ANVIL_E2E_CLIENT_SECRET: zanzibar-ci-owner-secret-with-at-least-32-bytes
         run: |
           set -euo pipefail
-          docker pull "$ANVIL_IMAGE"
-          docker volume create zanzibar-anvil-e2e-data
 
-          admin() {
-            docker run --rm \
-              -e ANVIL_SECRET_ENCRYPTION_KEY="$ANVIL_SECRET_ENCRYPTION_KEY" \
-              -e STORAGE_PATH=/var/lib/anvil \
-              -v zanzibar-anvil-e2e-data:/var/lib/anvil \
-              "$ANVIL_IMAGE" admin "$@"
-          }
+          qualification_dir="${RUNNER_TEMP}/zanzibar-anvil-e2e"
+          data_dir="${qualification_dir}/data"
+          signing_key="${qualification_dir}/token-signing-key"
+          mkdir -p "${data_dir}"
+          head -c 64 /dev/urandom >"${signing_key}"
+          chmod 0600 "${signing_key}"
 
-          admin region create zanzibar-ci
-          admin tenant create zanzibar-ci
-          app_output=$(admin app create --tenant-name zanzibar-ci --app-name zanzibar-ci-app)
-          printf '%s\n' "$app_output"
-          client_id=$(printf '%s\n' "$app_output" | awk -F': ' '/Client ID:/ { print $2 }')
-          client_secret=$(printf '%s\n' "$app_output" | awk -F': ' '/Client Secret:/ { print $2 }')
-          test -n "$client_id"
-          test -n "$client_secret"
-          admin policy grant --app-name zanzibar-ci-app --action '*' --resource '*'
+          docker pull "${ANVIL_IMAGE}"
+          docker run --rm --user 0 \
+            --volume "${qualification_dir}:/qualification" \
+            "${ANVIL_IMAGE}" chown -R 10001:10001 \
+              /qualification/data /qualification/token-signing-key
 
-          docker run -d --name zanzibar-anvil-e2e \
-            -p 50051:50051 \
-            -e JWT_SECRET="$JWT_SECRET" \
-            -e ANVIL_SECRET_ENCRYPTION_KEY="$ANVIL_SECRET_ENCRYPTION_KEY" \
-            -e CLUSTER_SECRET=zanzibar-ci-cluster-secret \
-            -e PUBLIC_API_ADDR=http://127.0.0.1:50051 \
-            -e API_LISTEN_ADDR=0.0.0.0:50051 \
-            -e CLUSTER_LISTEN_ADDR=/ip4/0.0.0.0/udp/0/quic-v1 \
-            -e REGION=zanzibar-ci \
-            -e INIT_CLUSTER=true \
-            -e ENABLE_MDNS=false \
-            -e STORAGE_PATH=/var/lib/anvil \
-            -v zanzibar-anvil-e2e-data:/var/lib/anvil \
-            "$ANVIL_IMAGE"
+          docker run --detach --name zanzibar-anvil-e2e \
+            --publish 127.0.0.1:50051:50051 \
+            --env ANVIL_LISTEN=0.0.0.0:50051 \
+            --env ANVIL_PEER_LISTEN=127.0.0.1:50052 \
+            --env ANVIL_DATA_DIR=/var/lib/anvil \
+            --env ANVIL_NODE_ID=1 \
+            --env ANVIL_TOKEN_SIGNING_KEY_FILE=/run/secrets/anvil-token-signing-key \
+            --env ANVIL_RUN_SYSTEM_BOOTSTRAP=true \
+            --volume "${data_dir}:/var/lib/anvil" \
+            --volume "${signing_key}:/run/secrets/anvil-token-signing-key:ro" \
+            "${ANVIL_IMAGE}"
 
-          for _ in {1..120}; do
-            if curl -fsS http://127.0.0.1:50051/ready >/dev/null; then
+          for _ in $(seq 1 90); do
+            if docker exec zanzibar-anvil-e2e \
+              test -f /var/lib/anvil/system-bootstrap-credential.json
+            then
+              break
+            fi
+            if ! docker inspect --format '{{.State.Running}}' zanzibar-anvil-e2e \
+              | grep -Fxq true
+            then
+              docker logs zanzibar-anvil-e2e
+              exit 1
+            fi
+            sleep 1
+          done
+          docker exec zanzibar-anvil-e2e \
+            test -f /var/lib/anvil/system-bootstrap-credential.json
+
+          provisioned=0
+          for _ in $(seq 1 30); do
+            if output="$(docker exec \
+              --env "ANVIL_NEW_CLIENT_SECRET=${ANVIL_E2E_CLIENT_SECRET}" \
+              zanzibar-anvil-e2e \
+              anvil --endpoint http://127.0.0.1:50051 \
+                --credentials-file /var/lib/anvil/system-bootstrap-credential.json \
+                provision-tenant zanzibar-ci zanzibar-ci-owner \
+                  zanzibar-ci-client 2>&1)" \
+              && grep -Fq 'tenant=zanzibar-ci' <<<"${output}"
+            then
+              provisioned=1
               break
             fi
             sleep 1
           done
-          curl -fsS http://127.0.0.1:50051/ready >/dev/null
+          if [[ "${provisioned}" != "1" ]]; then
+            docker logs zanzibar-anvil-e2e
+            exit 1
+          fi
+
+          docker exec --user 0 zanzibar-anvil-e2e \
+            rm /var/lib/anvil/system-bootstrap-credential.json
 
           {
             echo 'ANVIL_E2E_GRPC=http://127.0.0.1:50051'
-            echo "ANVIL_E2E_CLIENT_ID=$client_id"
-            echo "ANVIL_E2E_CLIENT_SECRET=$client_secret"
-          } >> "$GITHUB_ENV"
+            echo 'ANVIL_E2E_TENANT=zanzibar-ci'
+            echo 'ANVIL_E2E_CLIENT_ID=zanzibar-ci-client'
+            echo "ANVIL_E2E_CLIENT_SECRET=${ANVIL_E2E_CLIENT_SECRET}"
+          } >>"${GITHUB_ENV}"
 
       - name: Run Anvil backend tests
-        run: cargo test --features anvil --test anvil_backend -- --ignored --nocapture --test-threads=1
+        run: >-
+          cargo test --test anvil_backend --
+          --ignored --nocapture --test-threads=1
 
       - name: Dump Anvil logs
         if: always()
         run: docker logs zanzibar-anvil-e2e || true
+
+      - name: Stop Anvil
+        if: always()
+        run: docker rm --force zanzibar-anvil-e2e || true
