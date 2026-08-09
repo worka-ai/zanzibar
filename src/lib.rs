@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 pub mod anvil;
 
 use async_trait::async_trait;
