@@ -4,7 +4,7 @@ Model application authorization as relationships, then let Anvil answer the
 question that matters: **may this subject perform this action on this object?**
 
 `zanzibar` is a typed Rust API for schemas, relationship tuples, consistency,
-and permission checks backed by Anvil 0.5.5. It suits applications whose access
+and permission checks backed by Anvil 0.6.0. It suits applications whose access
 rules grow beyond a role column: shared documents, nested teams, delegated
 administration, tenant resources, public objects, and other relationship-based
 policies.
@@ -33,7 +33,7 @@ cargo add zanzibar@0.3
 cargo add tokio --features macros,rt-multi-thread
 ```
 
-The adapter targets Anvil 0.5.5. Start Anvil and provision a tenant owner by
+The adapter targets Anvil 0.6.0. Start Anvil and provision a tenant owner by
 following Anvil's [five-minute setup](https://github.com/worka-ai/anvil#your-first-object-in-five-minutes).
 That flow gives the application three values:
 
@@ -199,7 +199,7 @@ references are not yet exposed by this crate. Object/subject discovery and
 ordered tuple watches are also outside the API; applications can use paged
 tuple reads for bounded inspection.
 
-With Anvil 0.5.5, create and bind new custom realms while one cluster node is
+With Anvil 0.6.0, create and bind new custom realms while one cluster node is
 active, then expand the cluster. Existing bound realms continue to operate
 across the cluster.
 
