@@ -46,7 +46,7 @@ const MAX_PAGE_SIZE: u32 = 1_000;
 const ANVIL_PUBLIC_NAMESPACE: &str = "app";
 const ANVIL_PUBLIC_ID: &str = "_anvil/public";
 
-/// Durable application credentials used to connect to one Anvil 0.6 cluster.
+/// Durable application credentials used to connect to one Anvil 0.7 cluster.
 #[derive(Clone)]
 pub struct AnvilRebacConfig {
     pub endpoint: String,
