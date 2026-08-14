@@ -67,10 +67,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Start Anvil 0.8.1 and provision an application
+      - name: Start Anvil 0.8.2 and provision an application
         shell: bash
         env:
-          ANVIL_IMAGE: ghcr.io/worka-ai/anvil:0.8.1
+          ANVIL_IMAGE: ghcr.io/worka-ai/anvil:0.8.2
           ANVIL_E2E_CLIENT_SECRET: zanzibar-ci-owner-secret-with-at-least-32-bytes
         run: |
           set -euo pipefail

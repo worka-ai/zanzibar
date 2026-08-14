@@ -145,7 +145,7 @@ fn selector_and_traversal_schema() -> Schema {
 
 async fn engine() -> (AnvilRebacEngine, AnvilStorageTenantId) {
     let endpoint = std::env::var("ANVIL_E2E_GRPC")
-        .expect("ANVIL_E2E_GRPC must point to an Anvil 0.8.1 public endpoint");
+        .expect("ANVIL_E2E_GRPC must point to an Anvil 0.8.2 public endpoint");
     let storage_tenant = AnvilStorageTenantId(
         std::env::var("ANVIL_E2E_TENANT").expect("ANVIL_E2E_TENANT must be set"),
     );
