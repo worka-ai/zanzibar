@@ -15,7 +15,7 @@ documentation = "https://docs.rs/zanzibar"
 exclude = [".github/"]
 
 [dependencies]
-anvil-storage = { path = "../../../anvil/clients/rust" }
+anvil-storage = "=0.9.0"
 async-trait = "0.1.89"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
