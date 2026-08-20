@@ -3,15 +3,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex;
-use zanzibar::anvil::{AnvilRebacConfig, AnvilRebacEngine};
+use zanzibar::keldra::{KeldraRebacConfig, KeldraRebacEngine};
 use zanzibar::{
-    AnvilStorageTenantId, AuthzScope, CheckRequest, Consistency, MutateTuplesRequest,
+    AuthzScope, CheckRequest, Consistency, KeldraStorageTenantId, MutateTuplesRequest,
     NamespaceDefinition, Object, ObjectFilter, PermissionRule, ReadTuplesRequest, RebacEngine,
     RebacError, RelationDefinition, Schema, SchemaBuilder, SchemaId, Subject, SubjectSelector,
     Tuple, TupleFilter, TupleUpdate,
 };
 
-static ANVIL_E2E_LOCK: Mutex<()> = Mutex::const_new(());
+static KELDRA_E2E_LOCK: Mutex<()> = Mutex::const_new(());
 static UNIQUE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn object(namespace: &str, id: &str) -> Object {
@@ -143,30 +143,31 @@ fn selector_and_traversal_schema() -> Schema {
         .build()
 }
 
-async fn engine() -> (AnvilRebacEngine, AnvilStorageTenantId) {
-    let endpoint = std::env::var("ANVIL_E2E_GRPC")
-        .expect("ANVIL_E2E_GRPC must point to an Anvil 0.8.2 public endpoint");
-    let storage_tenant = AnvilStorageTenantId(
-        std::env::var("ANVIL_E2E_TENANT").expect("ANVIL_E2E_TENANT must be set"),
+async fn engine() -> (KeldraRebacEngine, KeldraStorageTenantId) {
+    let endpoint = std::env::var("KELDRA_E2E_GRPC")
+        .expect("KELDRA_E2E_GRPC must point to a Keldra 0.11.0 public endpoint");
+    let storage_tenant = KeldraStorageTenantId(
+        std::env::var("KELDRA_E2E_TENANT").expect("KELDRA_E2E_TENANT must be set"),
     );
-    let client_id = std::env::var("ANVIL_E2E_CLIENT_ID").expect("ANVIL_E2E_CLIENT_ID must be set");
+    let client_id =
+        std::env::var("KELDRA_E2E_CLIENT_ID").expect("KELDRA_E2E_CLIENT_ID must be set");
     let client_secret =
-        std::env::var("ANVIL_E2E_CLIENT_SECRET").expect("ANVIL_E2E_CLIENT_SECRET must be set");
+        std::env::var("KELDRA_E2E_CLIENT_SECRET").expect("KELDRA_E2E_CLIENT_SECRET must be set");
 
-    let engine = AnvilRebacEngine::connect(AnvilRebacConfig {
+    let engine = KeldraRebacEngine::connect(KeldraRebacConfig {
         endpoint,
         storage_tenant: storage_tenant.clone(),
         client_id,
         client_secret,
     })
     .await
-    .expect("connect and exchange Anvil application credentials");
+    .expect("connect and exchange Keldra application credentials");
     (engine, storage_tenant)
 }
 
 async fn publish_and_bind(
-    engine: &AnvilRebacEngine,
-    tenant: &AnvilStorageTenantId,
+    engine: &KeldraRebacEngine,
+    tenant: &KeldraStorageTenantId,
     scope: &AuthzScope,
 ) {
     let published = engine
@@ -184,9 +185,9 @@ async fn publish_and_bind(
 }
 
 #[tokio::test]
-#[ignore = "requires ANVIL_E2E_GRPC, ANVIL_E2E_TENANT, ANVIL_E2E_CLIENT_ID and ANVIL_E2E_CLIENT_SECRET"]
+#[ignore = "requires KELDRA_E2E_GRPC, KELDRA_E2E_TENANT, KELDRA_E2E_CLIENT_ID and KELDRA_E2E_CLIENT_SECRET"]
 async fn schema_lifecycle_and_server_side_checks_use_one_revision() {
-    let _guard = ANVIL_E2E_LOCK.lock().await;
+    let _guard = KELDRA_E2E_LOCK.lock().await;
     let (engine, tenant) = engine().await;
     let schema = authorization_schema();
     let schema_id = SchemaId(unique_id("schema-lifecycle"));
@@ -283,9 +284,9 @@ async fn schema_lifecycle_and_server_side_checks_use_one_revision() {
 }
 
 #[tokio::test]
-#[ignore = "requires ANVIL_E2E_GRPC, ANVIL_E2E_TENANT, ANVIL_E2E_CLIENT_ID and ANVIL_E2E_CLIENT_SECRET"]
+#[ignore = "requires KELDRA_E2E_GRPC, KELDRA_E2E_TENANT, KELDRA_E2E_CLIENT_ID and KELDRA_E2E_CLIENT_SECRET"]
 async fn exact_same_resource_public_and_tuple_to_userset_work_end_to_end() {
-    let _guard = ANVIL_E2E_LOCK.lock().await;
+    let _guard = KELDRA_E2E_LOCK.lock().await;
     let (engine, tenant) = engine().await;
     let schema = selector_and_traversal_schema();
     let scope = AuthzScope::new(tenant.clone(), unique_id("realm-selectors"));
@@ -376,9 +377,9 @@ async fn exact_same_resource_public_and_tuple_to_userset_work_end_to_end() {
 }
 
 #[tokio::test]
-#[ignore = "requires ANVIL_E2E_GRPC, ANVIL_E2E_TENANT, ANVIL_E2E_CLIENT_ID and ANVIL_E2E_CLIENT_SECRET"]
+#[ignore = "requires KELDRA_E2E_GRPC, KELDRA_E2E_TENANT, KELDRA_E2E_CLIENT_ID and KELDRA_E2E_CLIENT_SECRET"]
 async fn distinct_mutations_survive_replay_and_tuple_reads_paginate() {
-    let _guard = ANVIL_E2E_LOCK.lock().await;
+    let _guard = KELDRA_E2E_LOCK.lock().await;
     let (engine, tenant) = engine().await;
     let scope = AuthzScope::new(tenant.clone(), unique_id("realm-mutations"));
     publish_and_bind(&engine, &tenant, &scope).await;
@@ -487,9 +488,9 @@ async fn distinct_mutations_survive_replay_and_tuple_reads_paginate() {
 }
 
 #[tokio::test]
-#[ignore = "requires ANVIL_E2E_GRPC, ANVIL_E2E_TENANT, ANVIL_E2E_CLIENT_ID and ANVIL_E2E_CLIENT_SECRET"]
+#[ignore = "requires KELDRA_E2E_GRPC, KELDRA_E2E_TENANT, KELDRA_E2E_CLIENT_ID and KELDRA_E2E_CLIENT_SECRET"]
 async fn invalid_batches_are_atomic_and_tenant_mismatches_fail_closed() {
-    let _guard = ANVIL_E2E_LOCK.lock().await;
+    let _guard = KELDRA_E2E_LOCK.lock().await;
     let (engine, tenant) = engine().await;
     let scope = AuthzScope::new(tenant.clone(), unique_id("realm-atomicity"));
     publish_and_bind(&engine, &tenant, &scope).await;

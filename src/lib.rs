@@ -1,6 +1,6 @@
 #![doc = include_str!("../README.md")]
 
-pub mod anvil;
+pub mod keldra;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -27,14 +27,14 @@ impl std::fmt::Display for Object {
     }
 }
 
-/// An object, a userset, or Anvil's reserved public principal.
+/// An object, a userset, or Keldra's reserved public principal.
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub enum Subject {
     /// A specific entity such as `user:alice`.
     Entity(Object),
     /// Every subject related to an object, such as `group:editors#member`.
     Userset { object: Object, relation: String },
-    /// Anvil's reserved `app:_anvil/public` principal.
+    /// Keldra's reserved `app:_keldra/public` principal.
     Public,
 }
 
@@ -43,7 +43,7 @@ impl std::fmt::Display for Subject {
         match self {
             Subject::Entity(object) => write!(f, "{object}"),
             Subject::Userset { object, relation } => write!(f, "{object}#{relation}"),
-            Subject::Public => f.write_str("app:_anvil/public"),
+            Subject::Public => f.write_str("app:_keldra/public"),
         }
     }
 }
@@ -61,7 +61,7 @@ impl Subject {
         match self {
             Subject::Entity(object) => &object.id,
             Subject::Userset { object, .. } => &object.id,
-            Subject::Public => "_anvil/public",
+            Subject::Public => "_keldra/public",
         }
     }
 
@@ -173,8 +173,8 @@ impl Default for SchemaBuilder {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RebacError {
-    #[error("Anvil authorization error: {0}")]
-    Anvil(String),
+    #[error("Keldra authorization error: {0}")]
+    Keldra(String),
     #[error("authentication failed: {0}")]
     Unauthenticated(String),
     #[error("authorization denied: {0}")]
@@ -220,15 +220,15 @@ pub struct CheckRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct AnvilStorageTenantId(pub String);
+pub struct KeldraStorageTenantId(pub String);
 
-impl From<&str> for AnvilStorageTenantId {
+impl From<&str> for KeldraStorageTenantId {
     fn from(value: &str) -> Self {
         Self(value.to_string())
     }
 }
 
-impl From<String> for AnvilStorageTenantId {
+impl From<String> for KeldraStorageTenantId {
     fn from(value: String) -> Self {
         Self(value)
     }
@@ -251,17 +251,17 @@ impl From<String> for AuthzRealmId {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AuthzScope {
-    pub anvil_storage_tenant_id: AnvilStorageTenantId,
+    pub keldra_tenant_id: KeldraStorageTenantId,
     pub authz_realm_id: AuthzRealmId,
 }
 
 impl AuthzScope {
     pub fn new(
-        anvil_storage_tenant_id: impl Into<AnvilStorageTenantId>,
+        keldra_tenant_id: impl Into<KeldraStorageTenantId>,
         authz_realm_id: impl Into<AuthzRealmId>,
     ) -> Self {
         Self {
-            anvil_storage_tenant_id: anvil_storage_tenant_id.into(),
+            keldra_tenant_id: keldra_tenant_id.into(),
             authz_realm_id: authz_realm_id.into(),
         }
     }
@@ -367,7 +367,7 @@ pub struct ReadTuplesRequest {
     pub scope: AuthzScope,
     pub filter: TupleFilter,
     pub consistency: Consistency,
-    /// Zero selects Anvil's server default. The maximum is 1,000.
+    /// Zero selects Keldra's server default. The maximum is 1,000.
     pub page_size: u32,
     pub page_token: Option<String>,
 }
@@ -516,14 +516,14 @@ pub struct CheckManyResult {
 pub trait RebacEngine: Send + Sync {
     async fn put_schema(
         &self,
-        storage_tenant: &AnvilStorageTenantId,
+        storage_tenant: &KeldraStorageTenantId,
         schema_id: SchemaId,
         schema: Schema,
     ) -> Result<PutSchemaResult, RebacError>;
 
     async fn get_schema(
         &self,
-        storage_tenant: &AnvilStorageTenantId,
+        storage_tenant: &KeldraStorageTenantId,
         schema_ref: &SchemaRef,
     ) -> Result<(SchemaRef, Schema), RebacError>;
 
@@ -566,7 +566,7 @@ pub async fn put_and_bind_schema(
     expected_generation: Option<BindingGeneration>,
 ) -> Result<BindSchemaResult, RebacError> {
     let published = engine
-        .put_schema(&scope.anvil_storage_tenant_id, schema_id, schema)
+        .put_schema(&scope.keldra_tenant_id, schema_id, schema)
         .await?;
     engine
         .bind_schema(scope, published.schema_ref, expected_generation)
@@ -607,9 +607,9 @@ mod tests {
             .to_string(),
             "group:editors#member"
         );
-        assert_eq!(Subject::Public.to_string(), "app:_anvil/public");
+        assert_eq!(Subject::Public.to_string(), "app:_keldra/public");
         assert_eq!(Subject::Public.namespace(), "app");
-        assert_eq!(Subject::Public.id(), "_anvil/public");
+        assert_eq!(Subject::Public.id(), "_keldra/public");
         assert_eq!(Subject::Public.relation(), None);
     }
 

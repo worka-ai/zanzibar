@@ -1,15 +1,15 @@
 # Zanzibar for Rust
 
-Model application authorization as relationships, then let Anvil answer the
+Model application authorization as relationships, then let Keldra answer the
 question that matters: **may this subject perform this action on this object?**
 
 `zanzibar` is a typed Rust API for schemas, relationship tuples, consistency,
-and permission checks backed by Anvil 0.9.4. It suits applications whose access
+and permission checks backed by Keldra 0.11.0. It suits applications whose access
 rules grow beyond a role column: shared documents, nested teams, delegated
 administration, tenant resources, public objects, and other relationship-based
 policies.
 
-Anvil remains the durable authority and evaluates permissions server-side. The
+Keldra remains the durable authority and evaluates permissions server-side. The
 crate provides the application-facing model, authenticated connection, token
 refresh, exact schema bindings, atomic tuple mutations, and typed results.
 
@@ -33,23 +33,23 @@ cargo add zanzibar@0.3
 cargo add tokio --features macros,rt-multi-thread
 ```
 
-The adapter targets Anvil 0.9.4. Start Anvil and provision a tenant owner by
-following Anvil's [five-minute setup](https://github.com/worka-ai/anvil#your-first-object-in-five-minutes).
+The adapter targets Keldra 0.11.0. Start Keldra and provision a tenant owner by
+following Keldra's [five-minute setup](https://github.com/worka-ai/keldra#your-first-object-in-five-minutes).
 That flow gives the application three values:
 
 ```sh
-export ANVIL_ENDPOINT=http://127.0.0.1:50051
-export ANVIL_STORAGE_TENANT=example
-export ANVIL_CLIENT_ID=example-client
-export ANVIL_CLIENT_SECRET='the-secret-selected-during-provisioning'
+export KELDRA_ENDPOINT=http://127.0.0.1:50051
+export KELDRA_STORAGE_TENANT=example
+export KELDRA_CLIENT_ID=example-client
+export KELDRA_CLIENT_SECRET='the-secret-selected-during-provisioning'
 ```
 
 Use the HTTP endpoint only for loopback development. For networked deployments,
-put Anvil behind a TLS terminator and configure its `https://` endpoint before
+put Keldra behind a TLS terminator and configure its `https://` endpoint before
 sending application credentials.
 
-Applications authenticate with the client ID and secret. Anvil exchanges them
-for short-lived bearer credentials; `AnvilRebacEngine` refreshes those
+Applications authenticate with the client ID and secret. Keldra exchanges them
+for short-lived bearer credentials; `KeldraRebacEngine` refreshes those
 credentials before they expire.
 
 ## Define, bind, grant, and check
@@ -61,7 +61,7 @@ Alice access, and checks the permission at or after the mutation's revision.
 ```rust,no_run
 use std::collections::BTreeSet;
 
-use zanzibar::anvil::{AnvilRebacConfig, AnvilRebacEngine};
+use zanzibar::keldra::{KeldraRebacConfig, KeldraRebacEngine};
 use zanzibar::{
     AuthzScope, CheckRequest, Consistency, MutateTuplesRequest,
     NamespaceDefinition, Object, PermissionRule, RebacEngine,
@@ -71,12 +71,12 @@ use zanzibar::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let tenant = std::env::var("ANVIL_STORAGE_TENANT")?;
-    let engine = AnvilRebacEngine::connect(AnvilRebacConfig {
-        endpoint: std::env::var("ANVIL_ENDPOINT")?,
+    let tenant = std::env::var("KELDRA_STORAGE_TENANT")?;
+    let engine = KeldraRebacEngine::connect(KeldraRebacConfig {
+        endpoint: std::env::var("KELDRA_ENDPOINT")?,
         storage_tenant: tenant.clone().into(),
-        client_id: std::env::var("ANVIL_CLIENT_ID")?,
-        client_secret: std::env::var("ANVIL_CLIENT_SECRET")?,
+        client_id: std::env::var("KELDRA_CLIENT_ID")?,
+        client_secret: std::env::var("KELDRA_CLIENT_SECRET")?,
     })
     .await?;
 
@@ -153,7 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 ```
 
 The application that performs a realm's first schema binding becomes that
-realm's owner. Later calls are authorized by Anvil's Zanzibar policy just like
+realm's owner. Later calls are authorized by Keldra's Zanzibar policy just like
 the data being protected.
 
 ## Schemas and relationships
@@ -165,7 +165,7 @@ are legal. A permission is derived from direct relations or other permissions:
 - `TupleToUserset` follows a related object and evaluates a relation there.
 - `AnyUserset` permits subjects such as `group:engineering#member`, enabling
   nested group and delegation models.
-- `Public` permits Anvil's reserved anonymous principal as a tuple subject;
+- `Public` permits Keldra's reserved anonymous principal as a tuple subject;
   access is granted only when that tuple is written, and protected resources
   remain private by default.
 
@@ -179,13 +179,13 @@ Every tuple mutation and permission decision returns an `AuthzRevision`:
 
 - `Consistency::Latest` evaluates current authoritative state.
 - `Consistency::AtLeast(revision)` requires state that includes a known write;
-  if the serving state is still behind, Anvil returns `RevisionUnavailable`.
+  if the serving state is still behind, Keldra returns `RevisionUnavailable`.
 - `Consistency::Exact(revision)` evaluates only that current revision and fails
   if it is no longer retained.
 
 `MutateTuplesRequest` requires a caller-generated operation ID and a non-empty
 batch. Reuse an operation ID only when retrying the **same** logical batch; a new
-add or remove needs a new ID. Anvil applies up to 1,000 mutations atomically and
+add or remove needs a new ID. Keldra applies up to 1,000 mutations atomically and
 returns whether the call was replayed. `check_many` evaluates up to 1,000 checks
 at one revision while preserving request order.
 
@@ -194,12 +194,12 @@ and revision, preventing a multi-page result from drifting silently.
 
 ## Current scope
 
-This release models opaque authorization object IDs. Anvil exact-path object
+This release models opaque authorization object IDs. Keldra exact-path object
 references are not yet exposed by this crate. Object/subject discovery and
 ordered tuple watches are also outside the API; applications can use paged
 tuple reads for bounded inspection.
 
-With Anvil 0.9.4, create and bind new custom realms while one cluster node is
+With Keldra 0.11.0, create and bind new custom realms while one cluster node is
 active, then expand the cluster. Existing bound realms continue to operate
 across the cluster.
 

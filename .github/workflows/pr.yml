@@ -67,63 +67,63 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Start Anvil 0.9.2 and provision an application
+      - name: Start Keldra 0.11.0 and provision an application
         shell: bash
         env:
-          ANVIL_IMAGE: ghcr.io/worka-ai/anvil:0.9.2
-          ANVIL_E2E_CLIENT_SECRET: zanzibar-ci-owner-secret-with-at-least-32-bytes
+          KELDRA_IMAGE: ghcr.io/keldra-store/keldra:0.11.0
+          KELDRA_E2E_CLIENT_SECRET: zanzibar-ci-owner-secret-with-at-least-32-bytes
         run: |
           set -euo pipefail
 
-          qualification_dir="${RUNNER_TEMP}/zanzibar-anvil-e2e"
+          qualification_dir="${RUNNER_TEMP}/zanzibar-keldra-e2e"
           data_dir="${qualification_dir}/data"
           signing_key="${qualification_dir}/token-signing-key"
           mkdir -p "${data_dir}"
           head -c 64 /dev/urandom >"${signing_key}"
           chmod 0600 "${signing_key}"
 
-          docker pull "${ANVIL_IMAGE}"
+          docker pull "${KELDRA_IMAGE}"
           docker run --rm --user 0 \
             --volume "${qualification_dir}:/qualification" \
-            "${ANVIL_IMAGE}" chown -R 10001:10001 \
+            "${KELDRA_IMAGE}" chown -R 10001:10001 \
               /qualification/data /qualification/token-signing-key
 
-          docker run --detach --name zanzibar-anvil-e2e \
+          docker run --detach --name zanzibar-keldra-e2e \
             --publish 127.0.0.1:50051:50051 \
-            --env ANVIL_LISTEN=0.0.0.0:50051 \
-            --env ANVIL_PEER_LISTEN=127.0.0.1:50052 \
-            --env ANVIL_DATA_DIR=/var/lib/anvil \
-            --env ANVIL_NODE_ID=1 \
-            --env ANVIL_TOKEN_SIGNING_KEY_FILE=/run/secrets/anvil-token-signing-key \
-            --env ANVIL_RUN_SYSTEM_BOOTSTRAP=true \
-            --volume "${data_dir}:/var/lib/anvil" \
-            --volume "${signing_key}:/run/secrets/anvil-token-signing-key:ro" \
-            "${ANVIL_IMAGE}"
+            --env KELDRA_LISTEN=0.0.0.0:50051 \
+            --env KELDRA_PEER_LISTEN=127.0.0.1:50052 \
+            --env KELDRA_DATA_DIR=/var/lib/keldra \
+            --env KELDRA_NODE_ID=1 \
+            --env KELDRA_TOKEN_SIGNING_KEY_FILE=/run/secrets/keldra-token-signing-key \
+            --env KELDRA_RUN_SYSTEM_BOOTSTRAP=true \
+            --volume "${data_dir}:/var/lib/keldra" \
+            --volume "${signing_key}:/run/secrets/keldra-token-signing-key:ro" \
+            "${KELDRA_IMAGE}"
 
           for _ in $(seq 1 90); do
-            if docker exec zanzibar-anvil-e2e \
-              test -f /var/lib/anvil/system-bootstrap-credential.json
+            if docker exec zanzibar-keldra-e2e \
+              test -f /var/lib/keldra/system-bootstrap-credential.json
             then
               break
             fi
-            if ! docker inspect --format '{{.State.Running}}' zanzibar-anvil-e2e \
+            if ! docker inspect --format '{{.State.Running}}' zanzibar-keldra-e2e \
               | grep -Fxq true
             then
-              docker logs zanzibar-anvil-e2e
+              docker logs zanzibar-keldra-e2e
               exit 1
             fi
             sleep 1
           done
-          docker exec zanzibar-anvil-e2e \
-            test -f /var/lib/anvil/system-bootstrap-credential.json
+          docker exec zanzibar-keldra-e2e \
+            test -f /var/lib/keldra/system-bootstrap-credential.json
 
           provisioned=0
           for _ in $(seq 1 30); do
             if output="$(docker exec \
-              --env "ANVIL_NEW_CLIENT_SECRET=${ANVIL_E2E_CLIENT_SECRET}" \
-              zanzibar-anvil-e2e \
-              anvil --endpoint http://127.0.0.1:50051 \
-                --credentials-file /var/lib/anvil/system-bootstrap-credential.json \
+              --env "KELDRA_NEW_CLIENT_SECRET=${KELDRA_E2E_CLIENT_SECRET}" \
+              zanzibar-keldra-e2e \
+              keldra --endpoint http://127.0.0.1:50051 \
+                --credentials-file /var/lib/keldra/system-bootstrap-credential.json \
                 provision-tenant zanzibar-ci zanzibar-ci-owner \
                   zanzibar-ci-client 2>&1)" \
               && grep -Fq 'tenant=zanzibar-ci' <<<"${output}"
@@ -134,29 +134,29 @@ jobs:
             sleep 1
           done
           if [[ "${provisioned}" != "1" ]]; then
-            docker logs zanzibar-anvil-e2e
+            docker logs zanzibar-keldra-e2e
             exit 1
           fi
 
-          docker exec --user 0 zanzibar-anvil-e2e \
-            rm /var/lib/anvil/system-bootstrap-credential.json
+          docker exec --user 0 zanzibar-keldra-e2e \
+            rm /var/lib/keldra/system-bootstrap-credential.json
 
           {
-            echo 'ANVIL_E2E_GRPC=http://127.0.0.1:50051'
-            echo 'ANVIL_E2E_TENANT=zanzibar-ci'
-            echo 'ANVIL_E2E_CLIENT_ID=zanzibar-ci-client'
-            echo "ANVIL_E2E_CLIENT_SECRET=${ANVIL_E2E_CLIENT_SECRET}"
+            echo 'KELDRA_E2E_GRPC=http://127.0.0.1:50051'
+            echo 'KELDRA_E2E_TENANT=zanzibar-ci'
+            echo 'KELDRA_E2E_CLIENT_ID=zanzibar-ci-client'
+            echo "KELDRA_E2E_CLIENT_SECRET=${KELDRA_E2E_CLIENT_SECRET}"
           } >>"${GITHUB_ENV}"
 
-      - name: Run Anvil backend tests
+      - name: Run Keldra backend tests
         run: >-
-          cargo test --test anvil_backend --
+          cargo test --test keldra_backend --
           --ignored --nocapture --test-threads=1
 
-      - name: Dump Anvil logs
+      - name: Dump Keldra logs
         if: always()
-        run: docker logs zanzibar-anvil-e2e || true
+        run: docker logs zanzibar-keldra-e2e || true
 
-      - name: Stop Anvil
+      - name: Stop Keldra
         if: always()
-        run: docker rm --force zanzibar-anvil-e2e || true
+        run: docker rm --force zanzibar-keldra-e2e || true

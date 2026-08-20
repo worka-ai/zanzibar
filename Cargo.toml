@@ -5,8 +5,8 @@ edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.96"
 readme = "README.md"
-description = "Typed Zanzibar authorization for Rust, backed by Anvil."
-keywords = ["authorization", "zanzibar", "rebac", "anvil"]
+description = "Typed Zanzibar authorization for Rust, backed by Keldra."
+keywords = ["authorization", "zanzibar", "rebac", "keldra"]
 categories = ["authentication"]
 authors = ["Worka <engineering@worka.ai>"]
 homepage = "https://github.com/worka-ai/zanzibar"
@@ -15,7 +15,7 @@ documentation = "https://docs.rs/zanzibar"
 exclude = [".github/"]
 
 [dependencies]
-anvil-storage = "=0.9.4"
+keldra = "=0.11.0"
 async-trait = "0.1.89"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"

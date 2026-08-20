@@ -3,15 +3,16 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use anvil_storage::v1::authz_consistency::Requirement;
-use anvil_storage::v1::object_filter::Selection;
-use anvil_storage::v1::object_ref::Id;
-use anvil_storage::v1::permission_rule::Rule;
-use anvil_storage::v1::relation_definition::Kind as RelationKind;
-use anvil_storage::v1::subject::Kind as SubjectKind;
-use anvil_storage::v1::subject_selector::Selector;
-use anvil_storage::v1::tuple_mutation::Operation;
-use anvil_storage::v1::{
+use async_trait::async_trait;
+use keldra::v1::authz_consistency::Requirement;
+use keldra::v1::object_filter::Selection;
+use keldra::v1::object_ref::Id;
+use keldra::v1::permission_rule::Rule;
+use keldra::v1::relation_definition::Kind as RelationKind;
+use keldra::v1::subject::Kind as SubjectKind;
+use keldra::v1::subject_selector::Selector;
+use keldra::v1::tuple_mutation::Operation;
+use keldra::v1::{
     AnyObjectSelector, AnyUsersetSelector, AtLeastRevision, AuthzConsistency as ProtoConsistency,
     AuthzScope as ProtoScope, BindSchemaRequest, CheckPermissionRequest, CheckPermissionsRequest,
     DirectRelation, ExactRevision, GetBindingRequest, GetSchemaRequest, InheritRule,
@@ -24,18 +25,16 @@ use anvil_storage::v1::{
     SubjectSelector as ProtoSubjectSelector, TupleFilter as ProtoTupleFilter,
     TupleMutation as ProtoTupleMutation, TupleToUsersetRule, Userset,
 };
-use async_trait::async_trait;
 use tokio::sync::{Mutex, RwLock};
 use tonic::transport::Channel;
 use tonic::{Code, Status};
 
 use crate::{
-    AnvilStorageTenantId, AuthzRevision, AuthzScope, BindSchemaResult, BindingGeneration,
-    CheckDecision, CheckManyResult, CheckRequest, Consistency, MutateTuplesRequest,
-    MutateTuplesResult, NamespaceDefinition, Object, ObjectFilter, PermissionRule, PutSchemaResult,
-    ReadTuplesPage, ReadTuplesRequest, RebacEngine, RebacError, RelationDefinition, Schema,
-    SchemaBinding, SchemaId, SchemaRef, SchemaRevision, Subject, SubjectSelector, Tuple,
-    TupleFilter, TupleUpdate,
+    AuthzRevision, AuthzScope, BindSchemaResult, BindingGeneration, CheckDecision, CheckManyResult,
+    CheckRequest, Consistency, KeldraStorageTenantId, MutateTuplesRequest, MutateTuplesResult,
+    NamespaceDefinition, Object, ObjectFilter, PermissionRule, PutSchemaResult, ReadTuplesPage,
+    ReadTuplesRequest, RebacEngine, RebacError, RelationDefinition, Schema, SchemaBinding,
+    SchemaId, SchemaRef, SchemaRevision, Subject, SubjectSelector, Tuple, TupleFilter, TupleUpdate,
 };
 
 const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(30);
@@ -43,22 +42,22 @@ const TOKEN_EXCHANGE_ATTEMPTS: u32 = 12;
 const MAX_MUTATIONS: usize = 1_000;
 const MAX_CHECKS: usize = 1_000;
 const MAX_PAGE_SIZE: u32 = 1_000;
-const ANVIL_PUBLIC_NAMESPACE: &str = "app";
-const ANVIL_PUBLIC_ID: &str = "_anvil/public";
+const KELDRA_PUBLIC_NAMESPACE: &str = "app";
+const KELDRA_PUBLIC_ID: &str = "_keldra/public";
 
-/// Durable application credentials used to connect to one Anvil 0.8 cluster.
+/// Durable application credentials used to connect to one Keldra 0.11 cluster.
 #[derive(Clone)]
-pub struct AnvilRebacConfig {
+pub struct KeldraRebacConfig {
     pub endpoint: String,
-    pub storage_tenant: AnvilStorageTenantId,
+    pub storage_tenant: KeldraStorageTenantId,
     pub client_id: String,
     pub client_secret: String,
 }
 
-impl fmt::Debug for AnvilRebacConfig {
+impl fmt::Debug for KeldraRebacConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("AnvilRebacConfig")
+            .debug_struct("KeldraRebacConfig")
             .field("endpoint", &self.endpoint)
             .field("storage_tenant", &self.storage_tenant)
             .field("client_id", &self.client_id)
@@ -73,29 +72,29 @@ struct SessionToken {
     refresh_at: Instant,
 }
 
-struct AnvilSession {
-    config: AnvilRebacConfig,
+struct KeldraSession {
+    config: KeldraRebacConfig,
     channel: Channel,
     token: RwLock<Option<SessionToken>>,
     refresh: Mutex<()>,
 }
 
-impl fmt::Debug for AnvilSession {
+impl fmt::Debug for KeldraSession {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("AnvilSession")
+            .debug_struct("KeldraSession")
             .field("config", &self.config)
             .field("channel", &"<channel>")
             .finish()
     }
 }
 
-impl AnvilSession {
-    async fn connect(config: AnvilRebacConfig) -> Result<Arc<Self>, RebacError> {
+impl KeldraSession {
+    async fn connect(config: KeldraRebacConfig) -> Result<Arc<Self>, RebacError> {
         validate_config(&config)?;
-        let channel = anvil_storage::connect_channel(&config.endpoint)
+        let channel = keldra::connect_channel(&config.endpoint)
             .await
-            .map_err(|error| RebacError::Anvil(format!("failed to connect to Anvil: {error}")))?;
+            .map_err(|error| RebacError::Keldra(format!("failed to connect to Keldra: {error}")))?;
         let session = Arc::new(Self {
             config,
             channel,
@@ -106,10 +105,10 @@ impl AnvilSession {
         Ok(session)
     }
 
-    async fn client(&self) -> Result<anvil_storage::RawAuthzClient, RebacError> {
+    async fn client(&self) -> Result<keldra::RawAuthzClient, RebacError> {
         let token = self.access_token().await?;
-        anvil_storage::authz_client(self.channel.clone(), &token)
-            .map_err(|error| RebacError::Internal(format!("invalid Anvil access token: {error}")))
+        keldra::authz_client(self.channel.clone(), &token)
+            .map_err(|error| RebacError::Internal(format!("invalid Keldra access token: {error}")))
     }
 
     async fn access_token(&self) -> Result<String, RebacError> {
@@ -124,7 +123,7 @@ impl AnvilSession {
 
         let mut attempt = 0;
         let response = loop {
-            match anvil_storage::exchange_client_credentials(
+            match keldra::exchange_client_credentials(
                 self.channel.clone(),
                 self.config.client_id.clone(),
                 self.config.client_secret.clone(),
@@ -144,7 +143,7 @@ impl AnvilSession {
         };
         if response.access_token.trim().is_empty() || response.expires_in_seconds == 0 {
             return Err(RebacError::Internal(
-                "Anvil credential exchange returned an empty or expired token".into(),
+                "Keldra credential exchange returned an empty or expired token".into(),
             ));
         }
         let lifetime = Duration::from_secs(response.expires_in_seconds);
@@ -168,50 +167,50 @@ impl AnvilSession {
     }
 }
 
-/// A thin authenticated adapter over Anvil's authoritative authorization API.
+/// A thin authenticated adapter over Keldra's authoritative authorization API.
 #[derive(Clone)]
-pub struct AnvilRebacEngine {
-    session: Arc<AnvilSession>,
+pub struct KeldraRebacEngine {
+    session: Arc<KeldraSession>,
 }
 
-impl fmt::Debug for AnvilRebacEngine {
+impl fmt::Debug for KeldraRebacEngine {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("AnvilRebacEngine")
+            .debug_struct("KeldraRebacEngine")
             .field("session", &self.session)
             .finish()
     }
 }
 
-impl AnvilRebacEngine {
-    pub async fn connect(config: AnvilRebacConfig) -> Result<Self, RebacError> {
+impl KeldraRebacEngine {
+    pub async fn connect(config: KeldraRebacConfig) -> Result<Self, RebacError> {
         Ok(Self {
-            session: AnvilSession::connect(config).await?,
+            session: KeldraSession::connect(config).await?,
         })
     }
 
     fn validate_storage_tenant(
         &self,
-        storage_tenant: &AnvilStorageTenantId,
+        storage_tenant: &KeldraStorageTenantId,
     ) -> Result<(), RebacError> {
         if storage_tenant != &self.session.config.storage_tenant {
             return Err(RebacError::PermissionDenied(
-                "authorization tenant does not match the authenticated Anvil tenant".into(),
+                "authorization tenant does not match the authenticated Keldra tenant".into(),
             ));
         }
         Ok(())
     }
 
     fn validate_scope(&self, scope: &AuthzScope) -> Result<(), RebacError> {
-        self.validate_storage_tenant(&scope.anvil_storage_tenant_id)
+        self.validate_storage_tenant(&scope.keldra_tenant_id)
     }
 }
 
 #[async_trait]
-impl RebacEngine for AnvilRebacEngine {
+impl RebacEngine for KeldraRebacEngine {
     async fn put_schema(
         &self,
-        storage_tenant: &AnvilStorageTenantId,
+        storage_tenant: &KeldraStorageTenantId,
         schema_id: SchemaId,
         schema: Schema,
     ) -> Result<PutSchemaResult, RebacError> {
@@ -231,7 +230,7 @@ impl RebacEngine for AnvilRebacEngine {
         let schema_ref = response
             .schema_ref
             .ok_or_else(|| {
-                RebacError::Internal("Anvil schema response omitted its reference".into())
+                RebacError::Internal("Keldra schema response omitted its reference".into())
             })
             .and_then(schema_ref_from_proto)?;
         Ok(PutSchemaResult {
@@ -243,7 +242,7 @@ impl RebacEngine for AnvilRebacEngine {
 
     async fn get_schema(
         &self,
-        storage_tenant: &AnvilStorageTenantId,
+        storage_tenant: &KeldraStorageTenantId,
         schema_ref: &SchemaRef,
     ) -> Result<(SchemaRef, Schema), RebacError> {
         self.validate_storage_tenant(storage_tenant)?;
@@ -260,7 +259,7 @@ impl RebacEngine for AnvilRebacEngine {
         let response_ref = response
             .schema_ref
             .ok_or_else(|| {
-                RebacError::Internal("Anvil schema response omitted its reference".into())
+                RebacError::Internal("Keldra schema response omitted its reference".into())
             })
             .and_then(schema_ref_from_proto)?;
         Ok((response_ref, schema_from_proto(response.namespaces)?))
@@ -289,7 +288,7 @@ impl RebacEngine for AnvilRebacEngine {
             .into_inner();
         let binding = response
             .binding
-            .ok_or_else(|| RebacError::Internal("Anvil bind response omitted its binding".into()))
+            .ok_or_else(|| RebacError::Internal("Keldra bind response omitted its binding".into()))
             .and_then(binding_from_proto)?;
         Ok(BindSchemaResult {
             binding,
@@ -318,7 +317,7 @@ impl RebacEngine for AnvilRebacEngine {
         response
             .binding
             .ok_or_else(|| {
-                RebacError::Internal("Anvil binding response omitted its binding".into())
+                RebacError::Internal("Keldra binding response omitted its binding".into())
             })
             .and_then(binding_from_proto)
     }
@@ -361,7 +360,7 @@ impl RebacEngine for AnvilRebacEngine {
             .map(SystemTime::try_from)
             .transpose()
             .map_err(|error| {
-                RebacError::Internal(format!("Anvil returned an invalid replay expiry: {error}"))
+                RebacError::Internal(format!("Keldra returned an invalid replay expiry: {error}"))
             })?;
         Ok(MutateTuplesResult {
             revision: AuthzRevision(response.revision),
@@ -465,7 +464,7 @@ impl RebacEngine for AnvilRebacEngine {
             .into_inner();
         if response.results.len() != expected_results {
             return Err(RebacError::Internal(format!(
-                "Anvil returned {} permission results for {expected_results} checks",
+                "Keldra returned {} permission results for {expected_results} checks",
                 response.results.len()
             )));
         }
@@ -480,7 +479,7 @@ impl RebacEngine for AnvilRebacEngine {
     }
 }
 
-fn validate_config(config: &AnvilRebacConfig) -> Result<(), RebacError> {
+fn validate_config(config: &KeldraRebacConfig) -> Result<(), RebacError> {
     for (name, value) in [
         ("endpoint", config.endpoint.as_str()),
         ("storage tenant", config.storage_tenant.0.as_str()),
@@ -488,7 +487,7 @@ fn validate_config(config: &AnvilRebacConfig) -> Result<(), RebacError> {
         ("client secret", config.client_secret.as_str()),
     ] {
         if value.trim().is_empty() {
-            return Err(RebacError::Anvil(format!("Anvil {name} cannot be empty")));
+            return Err(RebacError::Keldra(format!("Keldra {name} cannot be empty")));
         }
     }
     Ok(())
@@ -496,7 +495,7 @@ fn validate_config(config: &AnvilRebacConfig) -> Result<(), RebacError> {
 
 fn scope_to_proto(scope: &AuthzScope) -> ProtoScope {
     ProtoScope {
-        storage_tenant: scope.anvil_storage_tenant_id.0.clone(),
+        storage_tenant: scope.keldra_tenant_id.0.clone(),
         realm: scope.authz_realm_id.0.clone(),
     }
 }
@@ -519,7 +518,7 @@ fn schema_ref_from_proto(schema_ref: ProtoSchemaRef) -> Result<SchemaRef, RebacE
         .try_into()
         .map_err(|value: Vec<u8>| {
             RebacError::Internal(format!(
-                "Anvil returned a schema digest with {} bytes instead of 32",
+                "Keldra returned a schema digest with {} bytes instead of 32",
                 value.len()
             ))
         })?;
@@ -533,10 +532,10 @@ fn schema_ref_from_proto(schema_ref: ProtoSchemaRef) -> Result<SchemaRef, RebacE
 fn binding_from_proto(binding: ProtoSchemaBinding) -> Result<SchemaBinding, RebacError> {
     let scope = binding
         .scope
-        .ok_or_else(|| RebacError::Internal("Anvil binding omitted its scope".into()))?;
-    let schema_ref = binding
-        .schema_ref
-        .ok_or_else(|| RebacError::Internal("Anvil binding omitted its schema reference".into()))?;
+        .ok_or_else(|| RebacError::Internal("Keldra binding omitted its scope".into()))?;
+    let schema_ref = binding.schema_ref.ok_or_else(|| {
+        RebacError::Internal("Keldra binding omitted its schema reference".into())
+    })?;
     Ok(SchemaBinding {
         scope: scope_from_proto(scope),
         schema_ref: schema_ref_from_proto(schema_ref)?,
@@ -558,10 +557,10 @@ fn object_from_proto(object: ObjectRef) -> Result<Object, RebacError> {
             id,
         }),
         Some(Id::ExactPath(_)) => Err(RebacError::Internal(
-            "Anvil returned an exact-path object that this Zanzibar model cannot represent".into(),
+            "Keldra returned an exact-path object that this Zanzibar model cannot represent".into(),
         )),
         None => Err(RebacError::Internal(
-            "Anvil authorization object omitted its ID".into(),
+            "Keldra authorization object omitted its ID".into(),
         )),
     }
 }
@@ -574,8 +573,8 @@ fn subject_to_proto(subject: Subject) -> ProtoSubject {
             relation,
         }),
         Subject::Public => SubjectKind::Object(ObjectRef {
-            namespace: ANVIL_PUBLIC_NAMESPACE.into(),
-            id: Some(Id::OpaqueId(ANVIL_PUBLIC_ID.into())),
+            namespace: KELDRA_PUBLIC_NAMESPACE.into(),
+            id: Some(Id::OpaqueId(KELDRA_PUBLIC_ID.into())),
         }),
     };
     ProtoSubject { kind: Some(kind) }
@@ -584,9 +583,9 @@ fn subject_to_proto(subject: Subject) -> ProtoSubject {
 fn subject_from_proto(subject: ProtoSubject) -> Result<Subject, RebacError> {
     match subject.kind {
         Some(SubjectKind::Object(object))
-            if object.namespace == ANVIL_PUBLIC_NAMESPACE
+            if object.namespace == KELDRA_PUBLIC_NAMESPACE
                 && object.id.as_ref().is_some_and(
-                    |id| matches!(id, Id::OpaqueId(value) if value == ANVIL_PUBLIC_ID),
+                    |id| matches!(id, Id::OpaqueId(value) if value == KELDRA_PUBLIC_ID),
                 ) =>
         {
             Ok(Subject::Public)
@@ -594,7 +593,7 @@ fn subject_from_proto(subject: ProtoSubject) -> Result<Subject, RebacError> {
         Some(SubjectKind::Object(object)) => object_from_proto(object).map(Subject::Entity),
         Some(SubjectKind::Userset(userset)) => {
             let object = userset.object.ok_or_else(|| {
-                RebacError::Internal("Anvil userset subject omitted its object".into())
+                RebacError::Internal("Keldra userset subject omitted its object".into())
             })?;
             Ok(Subject::Userset {
                 object: object_from_proto(object)?,
@@ -602,7 +601,7 @@ fn subject_from_proto(subject: ProtoSubject) -> Result<Subject, RebacError> {
             })
         }
         None => Err(RebacError::Internal(
-            "Anvil authorization subject omitted its kind".into(),
+            "Keldra authorization subject omitted its kind".into(),
         )),
     }
 }
@@ -617,10 +616,10 @@ fn tuple_to_proto(tuple: Tuple) -> RelationTuple {
 
 fn tuple_from_proto(tuple: RelationTuple) -> Result<Tuple, RebacError> {
     let object = tuple.object.ok_or_else(|| {
-        RebacError::Internal("Anvil authorization tuple omitted its object".into())
+        RebacError::Internal("Keldra authorization tuple omitted its object".into())
     })?;
     let subject = tuple.subject.ok_or_else(|| {
-        RebacError::Internal("Anvil authorization tuple omitted its subject".into())
+        RebacError::Internal("Keldra authorization tuple omitted its subject".into())
     })?;
     Ok(Tuple {
         object: object_from_proto(object)?,
@@ -796,7 +795,7 @@ fn schema_from_proto(namespaces: Vec<ProtoNamespaceDefinition>) -> Result<Schema
         let mut relations = std::collections::HashMap::new();
         for relation in namespace.relations {
             let definition = relation_from_proto(relation.kind.ok_or_else(|| {
-                RebacError::Internal("Anvil schema relation omitted its kind".into())
+                RebacError::Internal("Keldra schema relation omitted its kind".into())
             })?)?;
             relations.insert(relation.name, definition);
         }
@@ -841,7 +840,7 @@ fn selector_from_proto(selector: ProtoSubjectSelector) -> Result<SubjectSelector
         }),
         Some(Selector::Public(_)) => Ok(SubjectSelector::Public),
         None => Err(RebacError::Internal(
-            "Anvil schema subject selector omitted its kind".into(),
+            "Keldra schema subject selector omitted its kind".into(),
         )),
     }
 }
@@ -856,7 +855,7 @@ fn rule_from_proto(rule: ProtoPermissionRule) -> Result<PermissionRule, RebacErr
             target_relation: rule.target_relation,
         }),
         None => Err(RebacError::Internal(
-            "Anvil schema permission rule omitted its kind".into(),
+            "Keldra schema permission rule omitted its kind".into(),
         )),
     }
 }
@@ -956,7 +955,7 @@ fn map_status(status: Status) -> RebacError {
         Code::ResourceExhausted => RebacError::ResourceExhausted(message),
         Code::Unavailable | Code::DeadlineExceeded => RebacError::Unavailable(message),
         Code::Internal | Code::DataLoss | Code::Unknown => RebacError::Internal(message),
-        _ => RebacError::Anvil(format!("{}: {message}", status.code())),
+        _ => RebacError::Keldra(format!("{}: {message}", status.code())),
     }
 }
 
@@ -975,8 +974,8 @@ mod tests {
 
     #[test]
     fn debug_output_redacts_the_client_secret() {
-        let config = AnvilRebacConfig {
-            endpoint: "https://anvil.example".into(),
+        let config = KeldraRebacConfig {
+            endpoint: "https://keldra.example".into(),
             storage_tenant: "tenant-1".into(),
             client_id: "app-1".into(),
             client_secret: "do-not-print".into(),
