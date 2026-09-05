@@ -145,7 +145,7 @@ fn selector_and_traversal_schema() -> Schema {
 
 async fn engine() -> (KeldraRebacEngine, KeldraStorageTenantId) {
     let endpoint = std::env::var("KELDRA_E2E_GRPC")
-        .expect("KELDRA_E2E_GRPC must point to a Keldra 0.16.1 public endpoint");
+        .expect("KELDRA_E2E_GRPC must point to a Keldra 0.17.0 public endpoint");
     let storage_tenant = KeldraStorageTenantId(
         std::env::var("KELDRA_E2E_TENANT").expect("KELDRA_E2E_TENANT must be set"),
     );
