@@ -4,7 +4,7 @@ Model application authorization as relationships, then let Keldra answer the
 question that matters: **may this subject perform this action on this object?**
 
 `zanzibar` is a typed Rust API for schemas, relationship tuples, consistency,
-and permission checks backed by Keldra 0.18.0. It suits applications whose access
+and permission checks backed by Keldra 0.19.0. It suits applications whose access
 rules grow beyond a role column: shared documents, nested teams, delegated
 administration, tenant resources, public objects, and other relationship-based
 policies.
@@ -29,11 +29,11 @@ refresh, exact schema bindings, atomic tuple mutations, and typed results.
 ## Install
 
 ```sh
-cargo add zanzibar@0.6
+cargo add zanzibar@0.7
 cargo add tokio --features macros,rt-multi-thread
 ```
 
-The adapter targets Keldra 0.18.0. Start Keldra and provision a tenant owner by
+The adapter targets Keldra 0.19.0. Start Keldra and provision a tenant owner by
 following Keldra's [five-minute setup](https://github.com/worka-ai/keldra#your-first-object-in-five-minutes).
 That flow gives the application three values:
 
@@ -153,7 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 ```
 
 The application that performs a realm's first schema binding becomes that
-realm's owner. Later calls are authorized by Keldra's Zanzibar policy just like
+realm's owner. Later calls are authorised by Keldra's Zanzibar policy just like
 the data being protected.
 
 ## Schemas and relationships
@@ -199,7 +199,7 @@ references are not yet exposed by this crate. Object/subject discovery and
 ordered tuple watches are also outside the API; applications can use paged
 tuple reads for bounded inspection.
 
-With Keldra 0.18.0, create and bind new custom realms while one cluster node is
+With Keldra 0.19.0, create and bind new custom realms while one cluster node is
 active, then expand the cluster. Existing bound realms continue to operate
 across the cluster.
 

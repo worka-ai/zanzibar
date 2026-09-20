@@ -45,7 +45,7 @@ const MAX_PAGE_SIZE: u32 = 1_000;
 const KELDRA_PUBLIC_NAMESPACE: &str = "app";
 const KELDRA_PUBLIC_ID: &str = "_keldra/public";
 
-/// Durable application credentials used to connect to one Keldra 0.18 cluster.
+/// Durable application credentials used to connect to one Keldra 0.19 cluster.
 #[derive(Clone)]
 pub struct KeldraRebacConfig {
     pub endpoint: String,
