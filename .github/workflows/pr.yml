@@ -78,15 +78,18 @@ jobs:
           qualification_dir="${RUNNER_TEMP}/zanzibar-keldra-e2e"
           data_dir="${qualification_dir}/data"
           signing_key="${qualification_dir}/token-signing-key"
+          client_secret="${qualification_dir}/client-secret"
           mkdir -p "${data_dir}"
           head -c 64 /dev/urandom >"${signing_key}"
-          chmod 0600 "${signing_key}"
+          printf '%s' "${KELDRA_E2E_CLIENT_SECRET}" >"${client_secret}"
+          chmod 0600 "${signing_key}" "${client_secret}"
 
           docker pull "${KELDRA_IMAGE}"
           docker run --rm --user 0 \
             --volume "${qualification_dir}:/qualification" \
             "${KELDRA_IMAGE}" chown -R 10001:10001 \
-              /qualification/data /qualification/token-signing-key
+              /qualification/data /qualification/token-signing-key \
+              /qualification/client-secret
 
           docker run --detach --name zanzibar-keldra-e2e \
             --publish 127.0.0.1:50051:50051 \
@@ -98,6 +101,7 @@ jobs:
             --env KELDRA_RUN_SYSTEM_BOOTSTRAP=true \
             --volume "${data_dir}:/var/lib/keldra" \
             --volume "${signing_key}:/run/secrets/keldra-token-signing-key:ro" \
+            --volume "${client_secret}:/run/secrets/zanzibar-client-secret:ro" \
             "${KELDRA_IMAGE}"
 
           for _ in $(seq 1 90); do
@@ -119,13 +123,12 @@ jobs:
 
           provisioned=0
           for _ in $(seq 1 30); do
-            if output="$(docker exec \
-              --env "KELDRA_NEW_CLIENT_SECRET=${KELDRA_E2E_CLIENT_SECRET}" \
-              zanzibar-keldra-e2e \
+            if output="$(docker exec zanzibar-keldra-e2e \
               keldra --endpoint http://127.0.0.1:50051 \
                 --credentials-file /var/lib/keldra/system-bootstrap-credential.json \
-                provision-tenant zanzibar-ci zanzibar-ci-owner \
-                  zanzibar-ci-client 2>&1)" \
+                provision-tenant \
+                  --owner-client-secret-file /run/secrets/zanzibar-client-secret \
+                  zanzibar-ci zanzibar-ci-owner zanzibar-ci-client 2>&1)" \
               && grep -Fq 'tenant=zanzibar-ci' <<<"${output}"
             then
               provisioned=1
