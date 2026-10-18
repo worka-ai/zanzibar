@@ -20,7 +20,7 @@ refresh, exact schema bindings, atomic tuple mutations, and typed results.
 | Direct relations and derived permissions | Yes |
 | Entity, userset, same-resource, exact, and public subject selectors | Yes |
 | Nested userset evaluation | Yes |
-| Atomic add/remove batches with idempotent retries | Yes, up to 1,000 mutations |
+| Atomic add/remove batches | Yes, up to 1,000 mutations |
 | Single and ordered batch permission checks | Yes, up to 1,000 checks |
 | Latest, at-least, and exact-revision consistency | Yes |
 | Filtered, revision-pinned tuple pagination | Yes |
@@ -125,7 +125,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let written = engine
         .mutate_tuples(MutateTuplesRequest::new(
             scope.clone(),
-            "grant-roadmap-alice-v1",
             vec![TupleUpdate::Add(Tuple {
                 object: roadmap.clone(),
                 relation: "viewer".into(),
@@ -170,7 +169,7 @@ are legal. A permission is derived from direct relations or other permissions:
   remain private by default.
 
 Schemas are immutable and content-addressed by their returned `SchemaRef`.
-Publishing identical content is an idempotent replay. Binding uses a generation
+Publishing identical content returns the existing schema reference. Binding uses a generation
 check, so schema changes cannot silently overwrite a concurrent update.
 
 ## Consistency, batching, and retries
@@ -183,11 +182,11 @@ Every tuple mutation and permission decision returns an `AuthzRevision`:
 - `Consistency::Exact(revision)` evaluates only that current revision and fails
   if it is no longer retained.
 
-`MutateTuplesRequest` requires a caller-generated operation ID and a non-empty
-batch. Reuse an operation ID only when retrying the **same** logical batch; a new
-add or remove needs a new ID. Keldra applies up to 1,000 mutations atomically and
-returns whether the call was replayed. `check_many` evaluates up to 1,000 checks
-at one revision while preserving request order.
+`MutateTuplesRequest` requires a non-empty batch. Keldra applies up to 1,000
+mutations atomically. An expected revision can protect changes against concurrent
+updates. Requests are not deduplicated: after an uncertain response, read current
+state before deciding whether another mutation is needed. `check_many` evaluates
+up to 1,000 checks at one revision while preserving request order.
 
 Tuple reads are filtered and paginated. A continuation token pins its filters
 and revision, preventing a multi-page result from drifting silently.

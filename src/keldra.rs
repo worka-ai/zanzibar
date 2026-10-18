@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use keldra::v1::authz_consistency::Requirement;
@@ -236,7 +236,6 @@ impl RebacEngine for KeldraRebacEngine {
         Ok(PutSchemaResult {
             schema_ref,
             revision: AuthzRevision(response.revision),
-            replayed: response.replayed,
         })
     }
 
@@ -326,7 +325,7 @@ impl RebacEngine for KeldraRebacEngine {
         &self,
         request: MutateTuplesRequest,
     ) -> Result<MutateTuplesResult, RebacError> {
-        let (scope, operation_id, expected_revision, updates) = request.into_parts();
+        let (scope, expected_revision, updates) = request.into_parts();
         self.validate_scope(&scope)?;
         if updates.is_empty() {
             return Err(RebacError::InvalidMutation(
@@ -348,24 +347,14 @@ impl RebacEngine for KeldraRebacEngine {
             .await?
             .mutate_tuples(ProtoMutateTuplesRequest {
                 scope: Some(scope_to_proto(&scope)),
-                operation_id,
                 expected_revision: expected_revision.map(|value| value.0),
                 mutations,
             })
             .await
             .map_err(|status| map_mutation_status(status, &scope))?
             .into_inner();
-        let replay_guarantee_expires_at = response
-            .replay_guarantee_expires_at
-            .map(SystemTime::try_from)
-            .transpose()
-            .map_err(|error| {
-                RebacError::Internal(format!("Keldra returned an invalid replay expiry: {error}"))
-            })?;
         Ok(MutateTuplesResult {
             revision: AuthzRevision(response.revision),
-            replayed: response.replayed,
-            replay_guarantee_expires_at,
         })
     }
 

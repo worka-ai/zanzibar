@@ -4,14 +4,10 @@ pub mod keldra;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{BTreeSet, HashMap},
-    time::SystemTime,
-};
+use std::collections::{BTreeSet, HashMap};
 
 pub const SCHEMA_DIGEST_LENGTH: usize = 32;
 pub const MAX_MUTATIONS_PER_REQUEST: usize = 1_000;
-pub const MAX_OPERATION_ID_BYTES: usize = 128;
 pub const MAX_READ_PAGE_SIZE: u32 = 1_000;
 
 /// Identifies one object in an authorization graph.
@@ -81,7 +77,7 @@ pub struct Tuple {
     pub subject: Subject,
 }
 
-/// One idempotent set mutation within an atomic tuple batch.
+/// One relationship update within an atomic tuple batch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum TupleUpdate {
     Add(Tuple),
@@ -331,7 +327,6 @@ pub struct SchemaBinding {
 pub struct PutSchemaResult {
     pub schema_ref: SchemaRef,
     pub revision: AuthzRevision,
-    pub replayed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -420,28 +415,12 @@ pub struct ReadTuplesPage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MutateTuplesRequest {
     scope: AuthzScope,
-    operation_id: String,
     expected_revision: Option<AuthzRevision>,
     updates: Vec<TupleUpdate>,
 }
 
 impl MutateTuplesRequest {
-    pub fn new(
-        scope: AuthzScope,
-        operation_id: impl Into<String>,
-        updates: Vec<TupleUpdate>,
-    ) -> Result<Self, RebacError> {
-        let operation_id = operation_id.into();
-        if operation_id.is_empty() {
-            return Err(RebacError::InvalidMutation(
-                "operation ID must not be empty".to_string(),
-            ));
-        }
-        if operation_id.len() > MAX_OPERATION_ID_BYTES {
-            return Err(RebacError::InvalidMutation(format!(
-                "operation ID must be at most {MAX_OPERATION_ID_BYTES} bytes"
-            )));
-        }
+    pub fn new(scope: AuthzScope, updates: Vec<TupleUpdate>) -> Result<Self, RebacError> {
         if updates.is_empty() {
             return Err(RebacError::InvalidMutation(
                 "at least one tuple update is required".to_string(),
@@ -455,7 +434,6 @@ impl MutateTuplesRequest {
 
         Ok(Self {
             scope,
-            operation_id,
             expected_revision: None,
             updates,
         })
@@ -470,10 +448,6 @@ impl MutateTuplesRequest {
         &self.scope
     }
 
-    pub fn operation_id(&self) -> &str {
-        &self.operation_id
-    }
-
     pub fn expected_revision(&self) -> Option<AuthzRevision> {
         self.expected_revision
     }
@@ -482,21 +456,14 @@ impl MutateTuplesRequest {
         &self.updates
     }
 
-    pub fn into_parts(self) -> (AuthzScope, String, Option<AuthzRevision>, Vec<TupleUpdate>) {
-        (
-            self.scope,
-            self.operation_id,
-            self.expected_revision,
-            self.updates,
-        )
+    pub fn into_parts(self) -> (AuthzScope, Option<AuthzRevision>, Vec<TupleUpdate>) {
+        (self.scope, self.expected_revision, self.updates)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MutateTuplesResult {
     pub revision: AuthzRevision,
-    pub replayed: bool,
-    pub replay_guarantee_expires_at: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -707,44 +674,28 @@ mod tests {
     }
 
     #[test]
-    fn mutation_requires_a_caller_id_and_nonempty_bounded_updates() {
+    fn mutation_requires_nonempty_bounded_updates() {
         let scope = AuthzScope::new("tenant", "default");
         assert!(matches!(
-            MutateTuplesRequest::new(scope.clone(), "", vec![TupleUpdate::Add(tuple())]),
-            Err(RebacError::InvalidMutation(_))
-        ));
-        assert!(matches!(
-            MutateTuplesRequest::new(scope.clone(), "operation-1", Vec::new()),
+            MutateTuplesRequest::new(scope.clone(), Vec::new()),
             Err(RebacError::InvalidMutation(_))
         ));
         assert!(matches!(
             MutateTuplesRequest::new(
                 scope.clone(),
-                "x".repeat(MAX_OPERATION_ID_BYTES + 1),
-                vec![TupleUpdate::Add(tuple())]
-            ),
-            Err(RebacError::InvalidMutation(_))
-        ));
-        assert!(matches!(
-            MutateTuplesRequest::new(
-                scope.clone(),
-                "operation-too-large",
                 vec![TupleUpdate::Add(tuple()); MAX_MUTATIONS_PER_REQUEST + 1]
             ),
             Err(RebacError::InvalidMutation(_))
         ));
-
-        let request = MutateTuplesRequest::new(
-            scope.clone(),
-            "operation-2",
-            vec![TupleUpdate::Add(tuple())],
-        )
-        .unwrap()
-        .with_expected_revision(AuthzRevision(8));
-
+        let request = MutateTuplesRequest::new(scope.clone(), vec![TupleUpdate::Add(tuple())])
+            .unwrap()
+            .with_expected_revision(AuthzRevision(8));
         assert_eq!(request.scope(), &scope);
-        assert_eq!(request.operation_id(), "operation-2");
         assert_eq!(request.expected_revision(), Some(AuthzRevision(8)));
         assert_eq!(request.updates().len(), 1);
+        let (actual_scope, expected, updates) = request.into_parts();
+        assert_eq!(actual_scope, scope);
+        assert_eq!(expected, Some(AuthzRevision(8)));
+        assert_eq!(updates.len(), 1);
     }
 }

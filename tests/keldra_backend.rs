@@ -197,14 +197,12 @@ async fn schema_lifecycle_and_server_side_checks_use_one_revision() {
         .put_schema(&tenant, schema_id.clone(), schema.clone())
         .await
         .expect("publish schema");
-    assert!(!published.replayed);
 
-    let replay = engine
+    let identical = engine
         .put_schema(&tenant, schema_id, schema.clone())
         .await
-        .expect("replay identical schema publication");
-    assert!(replay.replayed);
-    assert_eq!(replay.schema_ref, published.schema_ref);
+        .expect("publish identical schema content");
+    assert_eq!(identical.schema_ref, published.schema_ref);
 
     let (loaded_ref, loaded_schema) = engine
         .get_schema(&tenant, &published.schema_ref)
@@ -238,7 +236,6 @@ async fn schema_lifecycle_and_server_side_checks_use_one_revision() {
     );
     let mutation = MutateTuplesRequest::new(
         scope.clone(),
-        unique_id("grant-userset"),
         vec![
             TupleUpdate::Add(group_members),
             TupleUpdate::Add(document_viewers),
@@ -312,7 +309,6 @@ async fn exact_same_resource_public_and_tuple_to_userset_work_end_to_end() {
         .mutate_tuples(
             MutateTuplesRequest::new(
                 scope.clone(),
-                unique_id("selector-and-traversal-tuples"),
                 vec![
                     TupleUpdate::Add(Tuple {
                         object: object("folder", "engineering"),
@@ -378,36 +374,26 @@ async fn exact_same_resource_public_and_tuple_to_userset_work_end_to_end() {
 
 #[tokio::test]
 #[ignore = "requires KELDRA_E2E_GRPC, KELDRA_E2E_TENANT, KELDRA_E2E_CLIENT_ID and KELDRA_E2E_CLIENT_SECRET"]
-async fn distinct_mutations_survive_replay_and_tuple_reads_paginate() {
+async fn distinct_mutations_update_relationships_and_tuple_reads_paginate() {
     let _guard = KELDRA_E2E_LOCK.lock().await;
     let (engine, tenant) = engine().await;
     let scope = AuthzScope::new(tenant.clone(), unique_id("realm-mutations"));
     publish_and_bind(&engine, &tenant, &scope).await;
 
     let alice_viewer = tuple("guide", "viewer", user("alice"));
-    let first_add = MutateTuplesRequest::new(
-        scope.clone(),
-        unique_id("add-alice-first"),
-        vec![TupleUpdate::Add(alice_viewer.clone())],
-    )
-    .unwrap();
+    let first_add =
+        MutateTuplesRequest::new(scope.clone(), vec![TupleUpdate::Add(alice_viewer.clone())])
+            .unwrap();
     let added = engine
-        .mutate_tuples(first_add.clone())
-        .await
-        .expect("add relationship");
-    let replayed = engine
         .mutate_tuples(first_add)
         .await
-        .expect("replay the same logical operation");
-    assert!(replayed.replayed);
-    assert_eq!(replayed.revision, added.revision);
-    assert!(replayed.replay_guarantee_expires_at.is_some());
+        .expect("add relationship");
+    assert!(added.revision.0 > 0);
 
     engine
         .mutate_tuples(
             MutateTuplesRequest::new(
                 scope.clone(),
-                unique_id("remove-alice"),
                 vec![TupleUpdate::Remove(alice_viewer.clone())],
             )
             .unwrap(),
@@ -432,7 +418,6 @@ async fn distinct_mutations_survive_replay_and_tuple_reads_paginate() {
         .mutate_tuples(
             MutateTuplesRequest::new(
                 scope.clone(),
-                unique_id("add-alice-second"),
                 vec![
                     TupleUpdate::Add(alice_viewer),
                     TupleUpdate::Add(tuple("guide", "viewer", user("bob"))),
@@ -441,7 +426,7 @@ async fn distinct_mutations_survive_replay_and_tuple_reads_paginate() {
             .unwrap(),
         )
         .await
-        .expect("add the relationship again with a distinct operation ID");
+        .expect("add the relationship again after removal");
 
     let filter = TupleFilter {
         object: Some(ObjectFilter::Exact(object("document", "guide"))),
@@ -495,7 +480,7 @@ async fn invalid_batches_are_atomic_and_tenant_mismatches_fail_closed() {
     let scope = AuthzScope::new(tenant.clone(), unique_id("realm-atomicity"));
     publish_and_bind(&engine, &tenant, &scope).await;
 
-    let empty = MutateTuplesRequest::new(scope.clone(), unique_id("empty"), Vec::new());
+    let empty = MutateTuplesRequest::new(scope.clone(), Vec::new());
     assert!(matches!(empty, Err(RebacError::InvalidMutation(_))));
 
     let valid_tuple = tuple("atomic", "viewer", user("alice"));
@@ -508,7 +493,6 @@ async fn invalid_batches_are_atomic_and_tenant_mismatches_fail_closed() {
         .mutate_tuples(
             MutateTuplesRequest::new(
                 scope.clone(),
-                unique_id("invalid-atomic-batch"),
                 vec![
                     TupleUpdate::Add(valid_tuple),
                     TupleUpdate::Add(invalid_tuple),
