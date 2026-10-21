@@ -233,8 +233,10 @@ Every tuple mutation and permission decision returns an `AuthzRevision`:
 
 `MutateTuplesRequest` requires a non-empty batch. Keldra applies up to 1,000
 mutations atomically. An expected revision can protect changes against concurrent
-updates. Requests are not deduplicated: after an uncertain response, read current
-state before deciding whether another mutation is needed. `check_many` evaluates
+updates. An optional `with_operation_id` enables five-minute, RAM-only retry
+deduplication; it does not survive server restart. Without an ID or after that
+window, read current state after an uncertain response before retrying.
+`check_many` evaluates
 up to 1,000 checks at one revision while preserving request order.
 
 Tuple reads are filtered and paginated. A continuation token pins its filters
@@ -242,9 +244,9 @@ and revision, preventing a multi-page result from drifting silently.
 
 ## Current scope
 
-This release models opaque authorization object IDs. Keldra exact-path object
-references are not yet exposed by this crate. Object/subject discovery and
-ordered tuple watches are also outside the API; applications can use paged
+Both opaque and exact-path authorization object IDs are supported through the
+models described above. Object/subject discovery and ordered tuple watches
+are outside the API; applications can use paged
 tuple reads for bounded inspection.
 
 With Keldra 0.24.0, create and bind new custom realms while one cluster node is
