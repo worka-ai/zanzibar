@@ -5,9 +5,11 @@ pub mod keldra;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
+use std::time::SystemTime;
 
 pub const SCHEMA_DIGEST_LENGTH: usize = 32;
 pub const MAX_MUTATIONS_PER_REQUEST: usize = 1_000;
+pub const MAX_OPERATION_ID_BYTES: usize = 128;
 pub const MAX_READ_PAGE_SIZE: u32 = 1_000;
 
 /// Identifies one object in an authorization graph.
@@ -415,6 +417,7 @@ pub struct ReadTuplesPage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MutateTuplesRequest {
     scope: AuthzScope,
+    operation_id: Option<String>,
     expected_revision: Option<AuthzRevision>,
     updates: Vec<TupleUpdate>,
 }
@@ -434,6 +437,7 @@ impl MutateTuplesRequest {
 
         Ok(Self {
             scope,
+            operation_id: None,
             expected_revision: None,
             updates,
         })
@@ -442,6 +446,26 @@ impl MutateTuplesRequest {
     pub fn with_expected_revision(mut self, revision: AuthzRevision) -> Self {
         self.expected_revision = Some(revision);
         self
+    }
+
+    /// Requests five-minute, RAM-only replay protection for this command.
+    /// This is not durable and does not survive server restart.
+    pub fn with_operation_id(
+        mut self,
+        operation_id: impl Into<String>,
+    ) -> Result<Self, RebacError> {
+        let operation_id = operation_id.into();
+        if operation_id.is_empty() || operation_id.len() > MAX_OPERATION_ID_BYTES {
+            return Err(RebacError::InvalidMutation(format!(
+                "operation ID must contain 1 to {MAX_OPERATION_ID_BYTES} bytes"
+            )));
+        }
+        self.operation_id = Some(operation_id);
+        Ok(self)
+    }
+
+    pub fn operation_id(&self) -> Option<&str> {
+        self.operation_id.as_deref()
     }
 
     pub fn scope(&self) -> &AuthzScope {
@@ -459,11 +483,33 @@ impl MutateTuplesRequest {
     pub fn into_parts(self) -> (AuthzScope, Option<AuthzRevision>, Vec<TupleUpdate>) {
         (self.scope, self.expected_revision, self.updates)
     }
+
+    /// Includes the optional command ID for adapters that support RAM-only replay.
+    pub fn into_parts_with_operation_id(
+        self,
+    ) -> (
+        AuthzScope,
+        Option<String>,
+        Option<AuthzRevision>,
+        Vec<TupleUpdate>,
+    ) {
+        (
+            self.scope,
+            self.operation_id,
+            self.expected_revision,
+            self.updates,
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MutateTuplesResult {
     pub revision: AuthzRevision,
+    /// Whether this response reused an earlier result held in server RAM.
+    pub replayed: bool,
+    /// End of the five-minute RAM-only replay window, when an ID was supplied.
+    /// This is not a durable guarantee and does not survive server restart.
+    pub replay_guarantee_expires_at: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -691,11 +737,54 @@ mod tests {
             .unwrap()
             .with_expected_revision(AuthzRevision(8));
         assert_eq!(request.scope(), &scope);
+        assert_eq!(request.operation_id(), None);
         assert_eq!(request.expected_revision(), Some(AuthzRevision(8)));
         assert_eq!(request.updates().len(), 1);
         let (actual_scope, expected, updates) = request.into_parts();
         assert_eq!(actual_scope, scope);
         assert_eq!(expected, Some(AuthzRevision(8)));
         assert_eq!(updates.len(), 1);
+    }
+
+    #[test]
+    fn mutation_operation_id_is_optional_and_validated_in_bytes() {
+        let request = || {
+            MutateTuplesRequest::new(
+                AuthzScope::new("tenant", "default"),
+                vec![TupleUpdate::Add(tuple())],
+            )
+            .unwrap()
+        };
+        assert!(request().with_operation_id("").is_err());
+        assert!(
+            request()
+                .with_operation_id("a".repeat(MAX_OPERATION_ID_BYTES + 1))
+                .is_err()
+        );
+        assert!(request().with_operation_id("é".repeat(65)).is_err());
+        let id = "é".repeat(64);
+        let request = request()
+            .with_expected_revision(AuthzRevision(9))
+            .with_operation_id(id.clone())
+            .unwrap();
+        assert_eq!(request.operation_id(), Some(id.as_str()));
+        let (scope, operation_id, revision, updates) = request.into_parts_with_operation_id();
+        assert_eq!(scope, AuthzScope::new("tenant", "default"));
+        assert_eq!(operation_id, Some(id));
+        assert_eq!(revision, Some(AuthzRevision(9)));
+        assert_eq!(updates, vec![TupleUpdate::Add(tuple())]);
+    }
+
+    #[test]
+    fn mutation_legacy_parts_remain_available_with_optional_operation_id() {
+        let scope = AuthzScope::new("tenant", "default");
+        let request = MutateTuplesRequest::new(scope.clone(), vec![TupleUpdate::Add(tuple())])
+            .unwrap()
+            .with_operation_id("client-command")
+            .unwrap();
+        let (actual_scope, expected, updates) = request.into_parts();
+        assert_eq!(actual_scope, scope);
+        assert_eq!(expected, None);
+        assert_eq!(updates, vec![TupleUpdate::Add(tuple())]);
     }
 }
