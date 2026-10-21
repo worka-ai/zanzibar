@@ -172,7 +172,7 @@ async fn exact_paths_round_trip_through_schema_mutation_reads_and_checks() {
         object: team.clone(),
         relation: "member".into(),
     };
-    let rows = vec![
+    let rows = [
         tuple(team, "member", user("alice")),
         tuple(document.clone(), "viewer", viewers.clone()),
         tuple(opaque_document.clone(), "viewer", user("bob")),
