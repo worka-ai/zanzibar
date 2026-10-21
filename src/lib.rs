@@ -1,6 +1,30 @@
 #![doc = include_str!("../README.md")]
 
+mod identity;
 pub mod keldra;
+pub use identity::ObjectId;
+
+/// Opt-in models that can mix opaque subjects with exact-path resources.
+/// Legacy root-level model names remain concrete opaque-ID models.
+pub mod exact_path {
+    pub use super::ObjectId;
+    pub type KeldraRebacEngine = super::keldra::TypedKeldraRebacEngine<ObjectId>;
+    pub type Object = super::TypedObject<ObjectId>;
+    pub type Subject = super::TypedSubject<ObjectId>;
+    pub type Tuple = super::TypedTuple<ObjectId>;
+    pub type TupleUpdate = super::TypedTupleUpdate<ObjectId>;
+    pub type SubjectSelector = super::TypedSubjectSelector<ObjectId>;
+    pub type RelationDefinition = super::TypedRelationDefinition<ObjectId>;
+    pub type NamespaceDefinition = super::TypedNamespaceDefinition<ObjectId>;
+    pub type Schema = super::TypedSchema<ObjectId>;
+    pub type SchemaBuilder = super::TypedSchemaBuilder<ObjectId>;
+    pub type CheckRequest = super::TypedCheckRequest<ObjectId>;
+    pub type ObjectFilter = super::TypedObjectFilter<ObjectId>;
+    pub type TupleFilter = super::TypedTupleFilter<ObjectId>;
+    pub type ReadTuplesRequest = super::TypedReadTuplesRequest<ObjectId>;
+    pub type ReadTuplesPage = super::TypedReadTuplesPage<ObjectId>;
+    pub type MutateTuplesRequest = super::TypedMutateTuplesRequest<ObjectId>;
+}
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -14,12 +38,13 @@ pub const MAX_READ_PAGE_SIZE: u32 = 1_000;
 
 /// Identifies one object in an authorization graph.
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
-pub struct Object {
+pub struct TypedObject<I> {
     pub namespace: String,
-    pub id: String,
+    pub id: I,
 }
+pub type Object = TypedObject<String>;
 
-impl std::fmt::Display for Object {
+impl<I: std::fmt::Display> std::fmt::Display for TypedObject<I> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{}", self.namespace, self.id)
     }
@@ -27,74 +52,90 @@ impl std::fmt::Display for Object {
 
 /// An object, a userset, or Keldra's reserved public principal.
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
-pub enum Subject {
+pub enum TypedSubject<I> {
     /// A specific entity such as `user:alice`.
-    Entity(Object),
+    Entity(TypedObject<I>),
     /// Every subject related to an object, such as `group:editors#member`.
-    Userset { object: Object, relation: String },
+    Userset {
+        object: TypedObject<I>,
+        relation: String,
+    },
     /// Keldra's reserved `app:_keldra/public` principal.
     Public,
 }
+pub type Subject = TypedSubject<String>;
 
-impl std::fmt::Display for Subject {
+impl<I: std::fmt::Display> std::fmt::Display for TypedSubject<I> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Subject::Entity(object) => write!(f, "{object}"),
-            Subject::Userset { object, relation } => write!(f, "{object}#{relation}"),
-            Subject::Public => f.write_str("app:_keldra/public"),
+            Self::Entity(object) => write!(f, "{object}"),
+            Self::Userset { object, relation } => write!(f, "{object}#{relation}"),
+            Self::Public => f.write_str("app:_keldra/public"),
         }
     }
 }
 
-impl Subject {
+impl<I> TypedSubject<I> {
     pub fn namespace(&self) -> &str {
         match self {
-            Subject::Entity(object) => &object.namespace,
-            Subject::Userset { object, .. } => &object.namespace,
-            Subject::Public => "app",
+            Self::Entity(object) => &object.namespace,
+            Self::Userset { object, .. } => &object.namespace,
+            Self::Public => "app",
         }
     }
 
-    pub fn id(&self) -> &str {
+    /// Typed graph identity; the reserved public principal has no user object.
+    pub fn object_id(&self) -> Option<&I> {
         match self {
-            Subject::Entity(object) => &object.id,
-            Subject::Userset { object, .. } => &object.id,
-            Subject::Public => "_keldra/public",
+            Self::Entity(object) | Self::Userset { object, .. } => Some(&object.id),
+            Self::Public => None,
         }
     }
 
     pub fn relation(&self) -> Option<&str> {
         match self {
-            Subject::Userset { relation, .. } => Some(relation),
-            Subject::Entity(_) | Subject::Public => None,
+            Self::Userset { relation, .. } => Some(relation),
+            Self::Entity(_) | Self::Public => None,
+        }
+    }
+}
+impl TypedSubject<String> {
+    /// The legacy opaque ID accessor, including the reserved public ID.
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Entity(object) | Self::Userset { object, .. } => &object.id,
+            Self::Public => "_keldra/public",
         }
     }
 }
 
 /// The statement "subject has relation to object".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct Tuple {
-    pub object: Object,
+pub struct TypedTuple<I> {
+    pub object: TypedObject<I>,
     pub relation: String,
-    pub subject: Subject,
+    pub subject: TypedSubject<I>,
 }
+pub type Tuple = TypedTuple<String>;
 
 /// One relationship update within an atomic tuple batch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum TupleUpdate {
-    Add(Tuple),
-    Remove(Tuple),
+pub enum TypedTupleUpdate<I> {
+    Add(TypedTuple<I>),
+    Remove(TypedTuple<I>),
 }
+pub type TupleUpdate = TypedTupleUpdate<String>;
 
 /// The subjects accepted by a direct relation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum SubjectSelector {
+pub enum TypedSubjectSelector<I> {
     AnyObject { namespace: String },
     AnyUserset { namespace: String, relation: String },
-    Exact(Subject),
+    Exact(TypedSubject<I>),
     SameResourceId { namespace: String },
     Public,
 }
+pub type SubjectSelector = TypedSubjectSelector<String>;
 
 /// One rule contributing to a derived permission.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -110,60 +151,89 @@ pub enum PermissionRule {
 
 /// A schema member is either tuple-bearing or derived; it cannot be both.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum RelationDefinition {
+#[serde(bound(deserialize = "I: Deserialize<'de> + Ord"))]
+pub enum TypedRelationDefinition<I> {
     Direct {
-        allowed_subjects: BTreeSet<SubjectSelector>,
+        allowed_subjects: BTreeSet<TypedSubjectSelector<I>>,
     },
     Permission {
         rules: BTreeSet<PermissionRule>,
     },
 }
+pub type RelationDefinition = TypedRelationDefinition<String>;
 
 /// All relations and permissions declared by one object namespace.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct NamespaceDefinition {
-    pub relations: HashMap<String, RelationDefinition>,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(bound(deserialize = "I: Deserialize<'de> + Ord"))]
+pub struct TypedNamespaceDefinition<I> {
+    pub relations: HashMap<String, TypedRelationDefinition<I>>,
 }
+pub type NamespaceDefinition = TypedNamespaceDefinition<String>;
 
-impl NamespaceDefinition {
+impl<I> Default for TypedNamespaceDefinition<I> {
+    fn default() -> Self {
+        Self {
+            relations: HashMap::new(),
+        }
+    }
+}
+impl<I> TypedNamespaceDefinition<I> {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn relation(mut self, name: impl Into<String>, definition: RelationDefinition) -> Self {
+    pub fn relation(
+        mut self,
+        name: impl Into<String>,
+        definition: TypedRelationDefinition<I>,
+    ) -> Self {
         self.relations.insert(name.into(), definition);
         self
     }
 }
 
 /// An immutable authorization schema body.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Schema {
-    pub namespaces: HashMap<String, NamespaceDefinition>,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(bound(deserialize = "I: Deserialize<'de> + Ord"))]
+pub struct TypedSchema<I> {
+    pub namespaces: HashMap<String, TypedNamespaceDefinition<I>>,
 }
+pub type Schema = TypedSchema<String>;
 
-pub struct SchemaBuilder {
-    schema: Schema,
+pub struct TypedSchemaBuilder<I> {
+    schema: TypedSchema<I>,
 }
+pub type SchemaBuilder = TypedSchemaBuilder<String>;
 
-impl SchemaBuilder {
+impl<I> Default for TypedSchema<I> {
+    fn default() -> Self {
+        Self {
+            namespaces: HashMap::new(),
+        }
+    }
+}
+impl<I> TypedSchemaBuilder<I> {
     pub fn new() -> Self {
         Self {
-            schema: Schema::default(),
+            schema: TypedSchema::default(),
         }
     }
 
-    pub fn namespace(mut self, name: impl Into<String>, definition: NamespaceDefinition) -> Self {
+    pub fn namespace(
+        mut self,
+        name: impl Into<String>,
+        definition: TypedNamespaceDefinition<I>,
+    ) -> Self {
         self.schema.namespaces.insert(name.into(), definition);
         self
     }
 
-    pub fn build(self) -> Schema {
+    pub fn build(self) -> TypedSchema<I> {
         self.schema
     }
 }
 
-impl Default for SchemaBuilder {
+impl<I> Default for TypedSchemaBuilder<I> {
     fn default() -> Self {
         Self::new()
     }
@@ -211,11 +281,12 @@ pub enum RebacError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CheckRequest {
-    pub subject: Subject,
+pub struct TypedCheckRequest<I> {
+    pub subject: TypedSubject<I>,
     pub relation: String,
-    pub object: Object,
+    pub object: TypedObject<I>,
 }
+pub type CheckRequest = TypedCheckRequest<String>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct KeldraStorageTenantId(pub String);
@@ -346,41 +417,53 @@ pub enum Consistency {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ObjectFilter {
+pub enum TypedObjectFilter<I> {
     Namespace(String),
-    Exact(Object),
+    Exact(TypedObject<I>),
 }
+pub type ObjectFilter = TypedObjectFilter<String>;
 
 /// Omitted fields are wildcards.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TupleFilter {
-    pub object: Option<ObjectFilter>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedTupleFilter<I> {
+    pub object: Option<TypedObjectFilter<I>>,
     pub relation: Option<String>,
-    pub subject: Option<Subject>,
+    pub subject: Option<TypedSubject<I>>,
+}
+pub type TupleFilter = TypedTupleFilter<String>;
+impl<I> Default for TypedTupleFilter<I> {
+    fn default() -> Self {
+        Self {
+            object: None,
+            relation: None,
+            subject: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReadTuplesRequest {
+pub struct TypedReadTuplesRequest<I> {
     pub scope: AuthzScope,
-    pub filter: TupleFilter,
+    pub filter: TypedTupleFilter<I>,
     pub consistency: Consistency,
     /// Zero selects Keldra's server default. The maximum is 1,000.
     pub page_size: u32,
     pub page_token: Option<String>,
 }
+pub type ReadTuplesRequest = TypedReadTuplesRequest<String>;
 
-impl ReadTuplesRequest {
+impl<I> TypedReadTuplesRequest<I> {
     pub fn new(scope: AuthzScope) -> Self {
         Self {
             scope,
-            filter: TupleFilter::default(),
+            filter: TypedTupleFilter::default(),
             consistency: Consistency::Latest,
             page_size: 0,
             page_token: None,
         }
     }
 
-    pub fn with_filter(mut self, filter: TupleFilter) -> Self {
+    pub fn with_filter(mut self, filter: TypedTupleFilter<I>) -> Self {
         self.filter = filter;
         self
     }
@@ -407,23 +490,25 @@ impl ReadTuplesRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReadTuplesPage {
-    pub tuples: Vec<Tuple>,
+pub struct TypedReadTuplesPage<I> {
+    pub tuples: Vec<TypedTuple<I>>,
     pub revision: AuthzRevision,
     pub next_page_token: Option<String>,
 }
+pub type ReadTuplesPage = TypedReadTuplesPage<String>;
 
 /// One validated all-or-nothing tuple mutation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MutateTuplesRequest {
+pub struct TypedMutateTuplesRequest<I> {
     scope: AuthzScope,
     operation_id: Option<String>,
     expected_revision: Option<AuthzRevision>,
-    updates: Vec<TupleUpdate>,
+    updates: Vec<TypedTupleUpdate<I>>,
 }
+pub type MutateTuplesRequest = TypedMutateTuplesRequest<String>;
 
-impl MutateTuplesRequest {
-    pub fn new(scope: AuthzScope, updates: Vec<TupleUpdate>) -> Result<Self, RebacError> {
+impl<I> TypedMutateTuplesRequest<I> {
+    pub fn new(scope: AuthzScope, updates: Vec<TypedTupleUpdate<I>>) -> Result<Self, RebacError> {
         if updates.is_empty() {
             return Err(RebacError::InvalidMutation(
                 "at least one tuple update is required".to_string(),
@@ -476,11 +561,11 @@ impl MutateTuplesRequest {
         self.expected_revision
     }
 
-    pub fn updates(&self) -> &[TupleUpdate] {
+    pub fn updates(&self) -> &[TypedTupleUpdate<I>] {
         &self.updates
     }
 
-    pub fn into_parts(self) -> (AuthzScope, Option<AuthzRevision>, Vec<TupleUpdate>) {
+    pub fn into_parts(self) -> (AuthzScope, Option<AuthzRevision>, Vec<TypedTupleUpdate<I>>) {
         (self.scope, self.expected_revision, self.updates)
     }
 
@@ -491,7 +576,7 @@ impl MutateTuplesRequest {
         AuthzScope,
         Option<String>,
         Option<AuthzRevision>,
-        Vec<TupleUpdate>,
+        Vec<TypedTupleUpdate<I>>,
     ) {
         (
             self.scope,
@@ -526,19 +611,19 @@ pub struct CheckManyResult {
 }
 
 #[async_trait]
-pub trait RebacEngine: Send + Sync {
+pub trait RebacEngine<I: Send + Sync + 'static = String>: Send + Sync {
     async fn put_schema(
         &self,
         storage_tenant: &KeldraStorageTenantId,
         schema_id: SchemaId,
-        schema: Schema,
+        schema: TypedSchema<I>,
     ) -> Result<PutSchemaResult, RebacError>;
 
     async fn get_schema(
         &self,
         storage_tenant: &KeldraStorageTenantId,
         schema_ref: &SchemaRef,
-    ) -> Result<(SchemaRef, Schema), RebacError>;
+    ) -> Result<(SchemaRef, TypedSchema<I>), RebacError>;
 
     async fn bind_schema(
         &self,
@@ -551,31 +636,34 @@ pub trait RebacEngine: Send + Sync {
 
     async fn mutate_tuples(
         &self,
-        request: MutateTuplesRequest,
+        request: TypedMutateTuplesRequest<I>,
     ) -> Result<MutateTuplesResult, RebacError>;
 
-    async fn read_tuples(&self, request: ReadTuplesRequest) -> Result<ReadTuplesPage, RebacError>;
+    async fn read_tuples(
+        &self,
+        request: TypedReadTuplesRequest<I>,
+    ) -> Result<TypedReadTuplesPage<I>, RebacError>;
 
     async fn check(
         &self,
         scope: &AuthzScope,
-        request: CheckRequest,
+        request: TypedCheckRequest<I>,
         consistency: Consistency,
     ) -> Result<CheckDecision, RebacError>;
 
     async fn check_many(
         &self,
         scope: &AuthzScope,
-        requests: Vec<CheckRequest>,
+        requests: Vec<TypedCheckRequest<I>>,
         consistency: Consistency,
     ) -> Result<CheckManyResult, RebacError>;
 }
 
-pub async fn put_and_bind_schema(
-    engine: &dyn RebacEngine,
+pub async fn put_and_bind_schema<I: Send + Sync + 'static>(
+    engine: &dyn RebacEngine<I>,
     scope: &AuthzScope,
     schema_id: SchemaId,
-    schema: Schema,
+    schema: TypedSchema<I>,
     expected_generation: Option<BindingGeneration>,
 ) -> Result<BindSchemaResult, RebacError> {
     let published = engine
@@ -786,5 +874,136 @@ mod tests {
         assert_eq!(actual_scope, scope);
         assert_eq!(expected, None);
         assert_eq!(updates, vec![TupleUpdate::Add(tuple())]);
+    }
+
+    #[test]
+    fn legacy_empty_constructors_and_struct_literals_remain_concrete() {
+        let object = Object {
+            namespace: "document".into(),
+            id: "legacy".into(),
+        };
+        assert_eq!(object.id, "legacy");
+        let schema = Schema::default();
+        let builder = SchemaBuilder::new();
+        let namespace = NamespaceDefinition::new();
+        let filter = TupleFilter::default();
+        let public = Subject::Public;
+        assert_eq!(public.id(), "_keldra/public");
+        assert!(schema.namespaces.is_empty());
+        assert!(builder.build().namespaces.is_empty());
+        assert!(namespace.relations.is_empty());
+        assert!(filter.object.is_none());
+    }
+
+    fn exact_object(path: &str) -> exact_path::Object {
+        exact_path::Object {
+            namespace: "document".into(),
+            id: ObjectId::ExactPath {
+                tenant: "storage-tenant".into(),
+                bucket: "mail".into(),
+                path: path.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn typed_models_mix_opaque_entities_and_exact_path_resources() {
+        use exact_path as ep;
+        let resource = exact_object("messages/one.json");
+        let subject = ep::Subject::Entity(ep::Object {
+            namespace: "user".into(),
+            id: ObjectId::Opaque("alice".into()),
+        });
+        let tuple = ep::Tuple {
+            object: resource.clone(),
+            relation: "reader".into(),
+            subject: subject.clone(),
+        };
+        let userset = ep::Subject::Userset {
+            object: exact_object("groups/editors.json"),
+            relation: "member".into(),
+        };
+        assert!(
+            matches!(userset.object_id(), Some(ObjectId::ExactPath { path, .. }) if path == "groups/editors.json")
+        );
+        assert_eq!(userset.namespace(), "document");
+        assert_eq!(userset.relation(), Some("member"));
+        assert_eq!(ep::Subject::Public.object_id(), None);
+        let request = ep::MutateTuplesRequest::new(
+            AuthzScope::new("storage-tenant", "default"),
+            vec![
+                ep::TupleUpdate::Add(tuple.clone()),
+                ep::TupleUpdate::Remove(tuple.clone()),
+            ],
+        )
+        .unwrap();
+        let (_, _, updates) = request.into_parts();
+        assert_eq!(updates.len(), 2);
+        let check = ep::CheckRequest {
+            subject,
+            object: resource.clone(),
+            relation: "read".into(),
+        };
+        assert_eq!(check.object, resource);
+        let request = ep::ReadTuplesRequest::new(AuthzScope::new("storage-tenant", "default"))
+            .with_filter(ep::TupleFilter {
+                object: Some(ep::ObjectFilter::Exact(resource)),
+                relation: Some("reader".into()),
+                subject: Some(userset),
+            });
+        let page = ep::ReadTuplesPage {
+            tuples: vec![tuple.clone()],
+            revision: AuthzRevision(4),
+            next_page_token: None,
+        };
+        assert!(matches!(
+            request.filter.object,
+            Some(ep::ObjectFilter::Exact(_))
+        ));
+        assert_eq!(page.tuples, vec![tuple]);
+    }
+
+    #[test]
+    fn typed_schema_builders_keep_exact_subject_selectors_without_default_identity() {
+        use exact_path as ep;
+        // ObjectId intentionally has no Default; empty containers need none.
+        let _ = ep::Schema::default();
+        let _ = ep::TupleFilter::default();
+        let exact = ep::Subject::Entity(exact_object("service/indexer.json"));
+        let selectors = BTreeSet::from([
+            ep::SubjectSelector::Exact(exact.clone()),
+            ep::SubjectSelector::AnyObject {
+                namespace: "user".into(),
+            },
+        ]);
+        let schema = ep::SchemaBuilder::new()
+            .namespace(
+                "document",
+                ep::NamespaceDefinition::new().relation(
+                    "reader",
+                    ep::RelationDefinition::Direct {
+                        allowed_subjects: selectors.clone(),
+                    },
+                ),
+            )
+            .build();
+        let ep::RelationDefinition::Direct { allowed_subjects } =
+            &schema.namespaces["document"].relations["reader"]
+        else {
+            panic!("expected direct relation")
+        };
+        assert_eq!(allowed_subjects, &selectors);
+        assert!(allowed_subjects.contains(&ep::SubjectSelector::Exact(exact)));
+        assert_ne!(
+            ObjectId::Opaque("messages/one.json".into()),
+            exact_object("messages/one.json").id
+        );
+        let mut changed_scope = exact_object("messages/one.json");
+        changed_scope.id = ObjectId::ExactPath {
+            tenant: "other".into(),
+            bucket: "mail".into(),
+            path: "messages/one.json".into(),
+        };
+        assert_ne!(changed_scope, exact_object("messages/one.json"));
     }
 }

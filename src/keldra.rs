@@ -31,10 +31,14 @@ use tonic::{Code, Status};
 
 use crate::{
     AuthzRevision, AuthzScope, BindSchemaResult, BindingGeneration, CheckDecision, CheckManyResult,
-    CheckRequest, Consistency, KeldraStorageTenantId, MutateTuplesRequest, MutateTuplesResult,
-    NamespaceDefinition, Object, ObjectFilter, PermissionRule, PutSchemaResult, ReadTuplesPage,
-    ReadTuplesRequest, RebacEngine, RebacError, RelationDefinition, Schema, SchemaBinding,
-    SchemaId, SchemaRef, SchemaRevision, Subject, SubjectSelector, Tuple, TupleFilter, TupleUpdate,
+    Consistency, KeldraStorageTenantId, MutateTuplesResult, ObjectId, PermissionRule,
+    PutSchemaResult, RebacEngine, RebacError, SchemaBinding, SchemaId, SchemaRef, SchemaRevision,
+    TypedCheckRequest as CheckRequest, TypedMutateTuplesRequest as MutateTuplesRequest,
+    TypedNamespaceDefinition as NamespaceDefinition, TypedObject as Object,
+    TypedObjectFilter as ObjectFilter, TypedReadTuplesPage as ReadTuplesPage,
+    TypedReadTuplesRequest as ReadTuplesRequest, TypedRelationDefinition as RelationDefinition,
+    TypedSchema as Schema, TypedSubject as Subject, TypedSubjectSelector as SubjectSelector,
+    TypedTuple as Tuple, TypedTupleFilter as TupleFilter, TypedTupleUpdate as TupleUpdate,
 };
 
 const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(30);
@@ -45,7 +49,63 @@ const MAX_PAGE_SIZE: u32 = 1_000;
 const KELDRA_PUBLIC_NAMESPACE: &str = "app";
 const KELDRA_PUBLIC_ID: &str = "_keldra/public";
 
-/// Durable application credentials used to connect to one Keldra 0.20 cluster.
+mod sealed {
+    pub trait Identity {}
+    impl Identity for String {}
+    impl Identity for crate::ObjectId {}
+}
+
+/// Identity representations supported by the adapter. Implementations are sealed.
+#[doc(hidden)]
+pub trait IdentityCodec: sealed::Identity + Clone + Ord + Send + Sync + 'static {
+    fn into_wire(self) -> Id;
+    fn from_wire(id: Id) -> Result<Self, RebacError>;
+}
+
+impl IdentityCodec for String {
+    fn into_wire(self) -> Id {
+        Id::OpaqueId(self)
+    }
+
+    fn from_wire(id: Id) -> Result<Self, RebacError> {
+        match id {
+            Id::OpaqueId(id) => Ok(id),
+            Id::ExactPath(_) => Err(RebacError::Internal(
+                "exact-path identity requires the exact_path model".into(),
+            )),
+        }
+    }
+}
+
+impl IdentityCodec for ObjectId {
+    fn into_wire(self) -> Id {
+        match self {
+            Self::Opaque(id) => Id::OpaqueId(id),
+            Self::ExactPath {
+                tenant,
+                bucket,
+                path,
+            } => Id::ExactPath(keldra::v1::ObjectAddress {
+                tenant,
+                bucket,
+                path,
+            }),
+        }
+    }
+
+    fn from_wire(id: Id) -> Result<Self, RebacError> {
+        Ok(match id {
+            Id::OpaqueId(id) => Self::Opaque(id),
+            Id::ExactPath(address) => Self::ExactPath {
+                tenant: address.tenant,
+                bucket: address.bucket,
+                path: address.path,
+            },
+        })
+    }
+}
+
+/// Durable application credentials used to connect to one Keldra 0.24 cluster.
 #[derive(Clone)]
 pub struct KeldraRebacConfig {
     pub endpoint: String,
@@ -169,11 +229,15 @@ impl KeldraSession {
 
 /// A thin authenticated adapter over Keldra's authoritative authorization API.
 #[derive(Clone)]
-pub struct KeldraRebacEngine {
+pub struct TypedKeldraRebacEngine<I> {
     session: Arc<KeldraSession>,
+    identity: std::marker::PhantomData<I>,
 }
 
-impl fmt::Debug for KeldraRebacEngine {
+/// The source-compatible opaque-ID adapter.
+pub type KeldraRebacEngine = TypedKeldraRebacEngine<String>;
+
+impl<I> fmt::Debug for TypedKeldraRebacEngine<I> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("KeldraRebacEngine")
@@ -182,10 +246,11 @@ impl fmt::Debug for KeldraRebacEngine {
     }
 }
 
-impl KeldraRebacEngine {
+impl<I> TypedKeldraRebacEngine<I> {
     pub async fn connect(config: KeldraRebacConfig) -> Result<Self, RebacError> {
         Ok(Self {
             session: KeldraSession::connect(config).await?,
+            identity: std::marker::PhantomData,
         })
     }
 
@@ -207,12 +272,12 @@ impl KeldraRebacEngine {
 }
 
 #[async_trait]
-impl RebacEngine for KeldraRebacEngine {
+impl<I: IdentityCodec> RebacEngine<I> for TypedKeldraRebacEngine<I> {
     async fn put_schema(
         &self,
         storage_tenant: &KeldraStorageTenantId,
         schema_id: SchemaId,
-        schema: Schema,
+        schema: Schema<I>,
     ) -> Result<PutSchemaResult, RebacError> {
         self.validate_storage_tenant(storage_tenant)?;
         let namespaces = schema_to_proto(&schema)?;
@@ -243,7 +308,7 @@ impl RebacEngine for KeldraRebacEngine {
         &self,
         storage_tenant: &KeldraStorageTenantId,
         schema_ref: &SchemaRef,
-    ) -> Result<(SchemaRef, Schema), RebacError> {
+    ) -> Result<(SchemaRef, Schema<I>), RebacError> {
         self.validate_storage_tenant(storage_tenant)?;
         let response = self
             .session
@@ -323,7 +388,7 @@ impl RebacEngine for KeldraRebacEngine {
 
     async fn mutate_tuples(
         &self,
-        request: MutateTuplesRequest,
+        request: MutateTuplesRequest<I>,
     ) -> Result<MutateTuplesResult, RebacError> {
         let (scope, operation_id, expected_revision, updates) =
             request.into_parts_with_operation_id();
@@ -369,7 +434,10 @@ impl RebacEngine for KeldraRebacEngine {
         })
     }
 
-    async fn read_tuples(&self, request: ReadTuplesRequest) -> Result<ReadTuplesPage, RebacError> {
+    async fn read_tuples(
+        &self,
+        request: ReadTuplesRequest<I>,
+    ) -> Result<ReadTuplesPage<I>, RebacError> {
         self.validate_scope(&request.scope)?;
         if request.page_size > MAX_PAGE_SIZE {
             return Err(RebacError::ResourceExhausted(format!(
@@ -406,7 +474,7 @@ impl RebacEngine for KeldraRebacEngine {
     async fn check(
         &self,
         scope: &AuthzScope,
-        request: CheckRequest,
+        request: CheckRequest<I>,
         consistency: Consistency,
     ) -> Result<CheckDecision, RebacError> {
         self.validate_scope(scope)?;
@@ -431,7 +499,7 @@ impl RebacEngine for KeldraRebacEngine {
     async fn check_many(
         &self,
         scope: &AuthzScope,
-        requests: Vec<CheckRequest>,
+        requests: Vec<CheckRequest<I>>,
         consistency: Consistency,
     ) -> Result<CheckManyResult, RebacError> {
         self.validate_scope(scope)?;
@@ -543,29 +611,24 @@ fn binding_from_proto(binding: ProtoSchemaBinding) -> Result<SchemaBinding, Reba
     })
 }
 
-fn object_to_proto(object: Object) -> ObjectRef {
+fn object_to_proto<I: IdentityCodec>(object: Object<I>) -> ObjectRef {
     ObjectRef {
         namespace: object.namespace,
-        id: Some(Id::OpaqueId(object.id)),
+        id: Some(object.id.into_wire()),
     }
 }
 
-fn object_from_proto(object: ObjectRef) -> Result<Object, RebacError> {
-    match object.id {
-        Some(Id::OpaqueId(id)) => Ok(Object {
-            namespace: object.namespace,
-            id,
-        }),
-        Some(Id::ExactPath(_)) => Err(RebacError::Internal(
-            "Keldra returned an exact-path object that this Zanzibar model cannot represent".into(),
-        )),
-        None => Err(RebacError::Internal(
-            "Keldra authorization object omitted its ID".into(),
-        )),
-    }
+fn object_from_proto<I: IdentityCodec>(object: ObjectRef) -> Result<Object<I>, RebacError> {
+    let id = object
+        .id
+        .ok_or_else(|| RebacError::Internal("Keldra authorization object omitted its ID".into()))?;
+    Ok(Object {
+        namespace: object.namespace,
+        id: I::from_wire(id)?,
+    })
 }
 
-fn subject_to_proto(subject: Subject) -> ProtoSubject {
+fn subject_to_proto<I: IdentityCodec>(subject: Subject<I>) -> ProtoSubject {
     let kind = match subject {
         Subject::Entity(object) => SubjectKind::Object(object_to_proto(object)),
         Subject::Userset { object, relation } => SubjectKind::Userset(Userset {
@@ -580,7 +643,7 @@ fn subject_to_proto(subject: Subject) -> ProtoSubject {
     ProtoSubject { kind: Some(kind) }
 }
 
-fn subject_from_proto(subject: ProtoSubject) -> Result<Subject, RebacError> {
+fn subject_from_proto<I: IdentityCodec>(subject: ProtoSubject) -> Result<Subject<I>, RebacError> {
     match subject.kind {
         Some(SubjectKind::Object(object))
             if object.namespace == KELDRA_PUBLIC_NAMESPACE
@@ -606,7 +669,7 @@ fn subject_from_proto(subject: ProtoSubject) -> Result<Subject, RebacError> {
     }
 }
 
-fn tuple_to_proto(tuple: Tuple) -> RelationTuple {
+fn tuple_to_proto<I: IdentityCodec>(tuple: Tuple<I>) -> RelationTuple {
     RelationTuple {
         object: Some(object_to_proto(tuple.object)),
         relation: tuple.relation,
@@ -614,7 +677,7 @@ fn tuple_to_proto(tuple: Tuple) -> RelationTuple {
     }
 }
 
-fn tuple_from_proto(tuple: RelationTuple) -> Result<Tuple, RebacError> {
+fn tuple_from_proto<I: IdentityCodec>(tuple: RelationTuple) -> Result<Tuple<I>, RebacError> {
     let object = tuple.object.ok_or_else(|| {
         RebacError::Internal("Keldra authorization tuple omitted its object".into())
     })?;
@@ -628,7 +691,9 @@ fn tuple_from_proto(tuple: RelationTuple) -> Result<Tuple, RebacError> {
     })
 }
 
-fn tuple_update_to_proto(update: TupleUpdate) -> Result<ProtoTupleMutation, RebacError> {
+fn tuple_update_to_proto<I: IdentityCodec>(
+    update: TupleUpdate<I>,
+) -> Result<ProtoTupleMutation, RebacError> {
     let operation = match update {
         TupleUpdate::Add(tuple) => Operation::Add(tuple_to_proto(tuple)),
         TupleUpdate::Remove(tuple) => Operation::Remove(tuple_to_proto(tuple)),
@@ -638,7 +703,7 @@ fn tuple_update_to_proto(update: TupleUpdate) -> Result<ProtoTupleMutation, Reba
     })
 }
 
-fn tuple_filter_to_proto(filter: TupleFilter) -> ProtoTupleFilter {
+fn tuple_filter_to_proto<I: IdentityCodec>(filter: TupleFilter<I>) -> ProtoTupleFilter {
     let object = filter.object.map(|filter| ProtoObjectFilter {
         selection: Some(match filter {
             ObjectFilter::Namespace(namespace) => Selection::Namespace(namespace),
@@ -667,7 +732,9 @@ fn consistency_to_proto(consistency: Consistency) -> ProtoConsistency {
     }
 }
 
-fn check_to_proto(request: CheckRequest) -> Result<PermissionCheck, RebacError> {
+fn check_to_proto<I: IdentityCodec>(
+    request: CheckRequest<I>,
+) -> Result<PermissionCheck, RebacError> {
     if matches!(request.subject, Subject::Userset { .. }) {
         return Err(RebacError::InvalidTuple(
             "permission checks require an entity or public subject, not a userset".into(),
@@ -680,7 +747,9 @@ fn check_to_proto(request: CheckRequest) -> Result<PermissionCheck, RebacError> 
     })
 }
 
-fn schema_to_proto(schema: &Schema) -> Result<Vec<ProtoNamespaceDefinition>, RebacError> {
+fn schema_to_proto<I: IdentityCodec>(
+    schema: &Schema<I>,
+) -> Result<Vec<ProtoNamespaceDefinition>, RebacError> {
     let mut namespaces = schema
         .namespaces
         .iter()
@@ -708,7 +777,9 @@ fn schema_to_proto(schema: &Schema) -> Result<Vec<ProtoNamespaceDefinition>, Reb
     Ok(namespaces)
 }
 
-fn relation_to_proto(definition: RelationDefinition) -> Result<RelationKind, RebacError> {
+fn relation_to_proto<I: IdentityCodec>(
+    definition: RelationDefinition<I>,
+) -> Result<RelationKind, RebacError> {
     match definition {
         RelationDefinition::Direct { allowed_subjects } => {
             if allowed_subjects.is_empty() {
@@ -739,7 +810,9 @@ fn relation_to_proto(definition: RelationDefinition) -> Result<RelationKind, Reb
     }
 }
 
-fn selector_to_proto(selector: SubjectSelector) -> Result<ProtoSubjectSelector, RebacError> {
+fn selector_to_proto<I: IdentityCodec>(
+    selector: SubjectSelector<I>,
+) -> Result<ProtoSubjectSelector, RebacError> {
     let selector = match selector {
         SubjectSelector::AnyObject { namespace } => {
             validate_component(&namespace, "subject namespace")?;
@@ -789,7 +862,9 @@ fn rule_to_proto(rule: PermissionRule) -> Result<ProtoPermissionRule, RebacError
     Ok(ProtoPermissionRule { rule: Some(rule) })
 }
 
-fn schema_from_proto(namespaces: Vec<ProtoNamespaceDefinition>) -> Result<Schema, RebacError> {
+fn schema_from_proto<I: IdentityCodec>(
+    namespaces: Vec<ProtoNamespaceDefinition>,
+) -> Result<Schema<I>, RebacError> {
     let mut schema = Schema::default();
     for namespace in namespaces {
         let mut relations = std::collections::HashMap::new();
@@ -806,7 +881,9 @@ fn schema_from_proto(namespaces: Vec<ProtoNamespaceDefinition>) -> Result<Schema
     Ok(schema)
 }
 
-fn relation_from_proto(kind: RelationKind) -> Result<RelationDefinition, RebacError> {
+fn relation_from_proto<I: IdentityCodec>(
+    kind: RelationKind,
+) -> Result<RelationDefinition<I>, RebacError> {
     match kind {
         RelationKind::Direct(direct) => Ok(RelationDefinition::Direct {
             allowed_subjects: direct
@@ -825,7 +902,9 @@ fn relation_from_proto(kind: RelationKind) -> Result<RelationDefinition, RebacEr
     }
 }
 
-fn selector_from_proto(selector: ProtoSubjectSelector) -> Result<SubjectSelector, RebacError> {
+fn selector_from_proto<I: IdentityCodec>(
+    selector: ProtoSubjectSelector,
+) -> Result<SubjectSelector<I>, RebacError> {
     match selector.selector {
         Some(Selector::AnyObject(selector)) => Ok(SubjectSelector::AnyObject {
             namespace: selector.namespace,
@@ -960,10 +1039,17 @@ fn map_status(status: Status) -> RebacError {
 }
 
 #[cfg(test)]
+#[path = "identity_tests.rs"]
+mod identity_tests;
+
+#[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, HashMap};
 
     use super::*;
+    use crate::{
+        NamespaceDefinition, Object, RelationDefinition, Schema, Subject, SubjectSelector, Tuple,
+    };
 
     fn object(namespace: &str, id: &str) -> Object {
         Object {
@@ -1112,8 +1198,9 @@ mod tests {
         .collect::<BTreeSet<_>>();
         assert_eq!(rules, same_rules);
         assert_eq!(
-            relation_to_proto(RelationDefinition::Permission { rules }).unwrap(),
-            relation_to_proto(RelationDefinition::Permission { rules: same_rules }).unwrap()
+            relation_to_proto::<String>(RelationDefinition::Permission { rules }).unwrap(),
+            relation_to_proto::<String>(RelationDefinition::Permission { rules: same_rules })
+                .unwrap()
         );
     }
 

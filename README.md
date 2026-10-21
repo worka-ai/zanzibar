@@ -20,6 +20,7 @@ refresh, exact schema bindings, atomic tuple mutations, and typed results.
 | Direct relations and derived permissions | Yes |
 | Entity, userset, same-resource, exact, and public subject selectors | Yes |
 | Nested userset evaluation | Yes |
+| Opaque and exact-path identities, including mixed tuples and schema selectors | Yes |
 | Atomic add/remove batches | Yes, up to 1,000 mutations |
 | Single and ordered batch permission checks | Yes, up to 1,000 checks |
 | Latest, at-least, and exact-revision consistency | Yes |
@@ -29,7 +30,7 @@ refresh, exact schema bindings, atomic tuple mutations, and typed results.
 ## Install
 
 ```sh
-cargo add zanzibar@0.8.5
+cargo add zanzibar@0.8.6
 cargo add tokio --features macros,rt-multi-thread
 ```
 
@@ -156,6 +157,54 @@ realm's owner. Later calls are authorised by Keldra's Zanzibar policy just like
 the data being protected.
 
 ## Schemas and relationships
+
+### Exact-path resources
+
+Existing top-level models and `keldra::KeldraRebacEngine` keep their opaque
+`String` IDs. Use the additive `exact_path` models and engine when a graph
+contains path-addressed resources. This API supports both identity kinds in
+one graph; paths are sent as Keldra's native `ExactPath`, never opaque strings.
+
+The existing model names are now concrete aliases of the shared typed models.
+Struct literals and qualified variants (`Subject::Entity`, `TupleUpdate::Add`)
+are unchanged. Rust cannot import enum variants through a type alias: callers
+using `use zanzibar::Subject::{Entity, Public}` must instead use qualified
+variants, or import variants from `zanzibar::TypedSubject`. No identity or
+serialization conversion is needed for existing opaque-ID values.
+
+```rust,no_run
+use zanzibar::{AuthzScope, Consistency, ObjectId, RebacEngine};
+use zanzibar::exact_path::{CheckRequest, KeldraRebacEngine, Object, Subject};
+
+async fn can_read(engine: &KeldraRebacEngine) -> Result<bool, zanzibar::RebacError> {
+    let scope = AuthzScope::new("example", "documents");
+    let decision = engine.check(&scope, CheckRequest {
+        subject: Subject::Entity(Object {
+            namespace: "user".into(),
+            id: ObjectId::Opaque("alice".into()),
+        }),
+        relation: "can_read".into(),
+        object: Object {
+            namespace: "document".into(),
+            id: ObjectId::ExactPath {
+                tenant: "example".into(),
+                bucket: "documents".into(),
+                path: "folders/report.json".into(),
+            },
+        },
+    }, Consistency::Latest).await?;
+    Ok(decision.allowed)
+}
+```
+
+Connect this engine using the same `KeldraRebacConfig` and `connect` method.
+Use `exact_path` aliases consistently for schemas, tuples, reads and checks.
+Exact addresses explicitly retain tenant, bucket and relative path, including
+in usersets and exact subject selectors. Keldra enforces its existing scope
+and address rules; this adapter does not reinterpret or redirect an address.
+The legacy opaque-only reader reports an error if a response contains an
+exact path it cannot represent. For object-plus-tuple atomic writes, use the
+official `keldra` client's existing `AtomicWrite` API.
 
 A direct relation accepts stored tuples. Its selectors say which typed subjects
 are legal. A permission is derived from direct relations or other permissions:
