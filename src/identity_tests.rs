@@ -78,6 +78,7 @@ fn mixed_tuple_mutations_filters_checks_and_usersets_preserve_identity() {
             filter.object.unwrap().selection,
             Some(Selection::Exact(object_to_proto(object.clone())))
         );
+        assert_eq!(filter.subject_namespace, None);
         assert_eq!(
             subject_from_proto::<ObjectId>(filter.subject.unwrap()).unwrap(),
             subject
