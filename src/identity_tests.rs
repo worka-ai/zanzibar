@@ -69,18 +69,24 @@ fn mixed_tuple_mutations_filters_checks_and_usersets_preserve_identity() {
             };
             assert_eq!(tuple_from_proto::<ObjectId>(tuple_wire).unwrap(), tuple);
         }
-        let filter = tuple_filter_to_proto(typed::TupleFilter {
+        let mut filter = tuple_filter_to_proto(typed::TupleFilter {
             object: Some(typed::ObjectFilter::Exact(object.clone())),
             relation: Some("viewer".into()),
             subject: Some(subject.clone()),
         });
         assert_eq!(
-            filter.object.unwrap().selection,
+            filter.object.take().unwrap().selection,
             Some(Selection::Exact(object_to_proto(object.clone())))
         );
         assert_eq!(
-            subject_from_proto::<ObjectId>(filter.subject.unwrap()).unwrap(),
+            subject_from_proto::<ObjectId>(filter.subject.take().unwrap()).unwrap(),
             subject
+        );
+        assert_eq!(filter.relation.take().as_deref(), Some("viewer"));
+        assert_eq!(
+            filter,
+            ProtoTupleFilter::default(),
+            "identity conversion must not introduce additional tuple restrictions"
         );
         let request = typed::CheckRequest {
             object: object.clone(),

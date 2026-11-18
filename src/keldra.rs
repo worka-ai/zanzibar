@@ -714,6 +714,7 @@ fn tuple_filter_to_proto<I: IdentityCodec>(filter: TupleFilter<I>) -> ProtoTuple
         object,
         relation: filter.relation,
         subject: filter.subject.map(subject_to_proto),
+        ..Default::default()
     }
 }
 
