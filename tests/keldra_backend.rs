@@ -414,7 +414,7 @@ async fn distinct_mutations_update_relationships_and_tuple_reads_paginate() {
         .expect("check removed relationship");
     assert!(!removed.allowed);
 
-    engine
+    let added_again = engine
         .mutate_tuples(
             MutateTuplesRequest::new(
                 scope.clone(),
@@ -438,6 +438,7 @@ async fn distinct_mutations_update_relationships_and_tuple_reads_paginate() {
         .read_tuples(
             ReadTuplesRequest::new(scope.clone())
                 .with_filter(filter.clone())
+                .with_consistency(Consistency::AtLeast(added_again.revision))
                 .with_page_size(1)
                 .unwrap(),
         )
