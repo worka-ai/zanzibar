@@ -444,6 +444,7 @@ impl<I: IdentityCodec> RebacEngine<I> for TypedKeldraRebacEngine<I> {
                 "tuple page size exceeds the {MAX_PAGE_SIZE} item limit"
             )));
         }
+        let expected_subject_namespace = request.filter.subject_namespace.clone();
         let response = self
             .session
             .client()
@@ -458,6 +459,10 @@ impl<I: IdentityCodec> RebacEngine<I> for TypedKeldraRebacEngine<I> {
             .await
             .map_err(|status| map_read_status(status, &request.scope))?
             .into_inner();
+        require_applied_subject_namespace(
+            expected_subject_namespace.as_deref(),
+            response.applied_subject_namespace.as_deref(),
+        )?;
         let tuples = response
             .tuples
             .into_iter()
@@ -715,6 +720,19 @@ fn tuple_filter_to_proto<I: IdentityCodec>(filter: TupleFilter<I>) -> ProtoTuple
         relation: filter.relation,
         subject: filter.subject.map(subject_to_proto),
         subject_namespace: filter.subject_namespace,
+    }
+}
+
+pub(crate) fn require_applied_subject_namespace(
+    expected: Option<&str>,
+    applied: Option<&str>,
+) -> Result<(), RebacError> {
+    if expected == applied {
+        Ok(())
+    } else {
+        Err(RebacError::Internal(
+            "Keldra did not confirm the requested subject namespace tuple filter".into(),
+        ))
     }
 }
 

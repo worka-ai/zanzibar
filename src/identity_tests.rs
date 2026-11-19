@@ -13,6 +13,23 @@ fn path(namespace: &str, tenant: &str, bucket: &str, path: &str) -> typed::Objec
 }
 
 #[test]
+fn subject_namespace_filter_is_encoded_and_requires_server_echo() {
+    let filter =
+        tuple_filter_to_proto(typed::TupleFilter::default().with_subject_namespace("user"));
+    assert_eq!(filter.subject_namespace.as_deref(), Some("user"));
+
+    assert!(crate::keldra::require_applied_subject_namespace(Some("user"), Some("user")).is_ok());
+    assert!(matches!(
+        crate::keldra::require_applied_subject_namespace(Some("user"), None),
+        Err(RebacError::Internal(_))
+    ));
+    assert!(matches!(
+        crate::keldra::require_applied_subject_namespace(Some("user"), Some("team")),
+        Err(RebacError::Internal(_))
+    ));
+}
+
+#[test]
 fn exact_identity_preserves_wire_kind_and_all_address_components() {
     let object = path("document", "tenant-a", "documents", "folders/report.json");
     let wire = object_to_proto(object.clone());
