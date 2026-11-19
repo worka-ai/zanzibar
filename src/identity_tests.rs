@@ -35,6 +35,24 @@ fn exact_identity_preserves_wire_kind_and_all_address_components() {
 }
 
 #[test]
+fn subject_namespace_filter_is_encoded_and_requires_server_echo() {
+    let filter =
+        tuple_filter_to_proto(typed::TupleFilter::default().with_subject_namespace("user"));
+    assert_eq!(filter.subject_namespace.as_deref(), Some("user"));
+    assert!(crate::keldra::require_applied_subject_namespace(None, None).is_ok());
+    assert!(crate::keldra::require_applied_subject_namespace(None, Some("user")).is_err());
+    assert!(crate::keldra::require_applied_subject_namespace(Some("user"), Some("user")).is_ok());
+    assert!(matches!(
+        crate::keldra::require_applied_subject_namespace(Some("user"), None),
+        Err(RebacError::Internal(_))
+    ));
+    assert!(matches!(
+        crate::keldra::require_applied_subject_namespace(Some("user"), Some("team")),
+        Err(RebacError::Internal(_))
+    ));
+}
+
+#[test]
 fn mixed_tuple_mutations_filters_checks_and_usersets_preserve_identity() {
     let object = path("document", "tenant", "docs", "report.json");
     let subjects = [
@@ -73,6 +91,7 @@ fn mixed_tuple_mutations_filters_checks_and_usersets_preserve_identity() {
             object: Some(typed::ObjectFilter::Exact(object.clone())),
             relation: Some("viewer".into()),
             subject: Some(subject.clone()),
+            subject_namespace: Some("user".into()),
         });
         assert_eq!(
             filter.object.take().unwrap().selection,
@@ -83,6 +102,7 @@ fn mixed_tuple_mutations_filters_checks_and_usersets_preserve_identity() {
             subject
         );
         assert_eq!(filter.relation.take().as_deref(), Some("viewer"));
+        assert_eq!(filter.subject_namespace.take().as_deref(), Some("user"));
         assert_eq!(
             filter,
             ProtoTupleFilter::default(),

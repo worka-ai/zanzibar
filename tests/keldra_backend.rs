@@ -432,6 +432,7 @@ async fn distinct_mutations_update_relationships_and_tuple_reads_paginate() {
         object: Some(ObjectFilter::Exact(object("document", "guide"))),
         relation: Some("viewer".into()),
         subject: None,
+        ..Default::default()
     };
     let first_page = engine
         .read_tuples(
@@ -532,4 +533,182 @@ async fn invalid_batches_are_atomic_and_tenant_mismatches_fail_closed() {
         .await
         .expect_err("a scope cannot switch the authenticated storage tenant");
     assert!(matches!(mismatch, RebacError::PermissionDenied(_)));
+}
+
+#[tokio::test]
+#[ignore = "requires KELDRA_E2E_GRPC, KELDRA_E2E_TENANT, KELDRA_E2E_CLIENT_ID and KELDRA_E2E_CLIENT_SECRET"]
+async fn posthorn_subject_page_filters_before_pagination_and_keeps_its_revision() {
+    let _guard = KELDRA_E2E_LOCK.lock().await;
+    let (engine, tenant) = engine().await;
+    let scope = AuthzScope::new(tenant.clone(), unique_id("realm-subject-page"));
+    let schema = SchemaBuilder::new()
+        .namespace("user", NamespaceDefinition::new())
+        .namespace("service", NamespaceDefinition::new())
+        .namespace(
+            "group",
+            NamespaceDefinition::new().relation(
+                "member",
+                RelationDefinition::Direct {
+                    allowed_subjects: BTreeSet::from([SubjectSelector::AnyObject {
+                        namespace: "user".into(),
+                    }]),
+                },
+            ),
+        )
+        .namespace(
+            "document",
+            NamespaceDefinition::new().relation(
+                "viewer",
+                RelationDefinition::Direct {
+                    allowed_subjects: BTreeSet::from([
+                        SubjectSelector::AnyObject {
+                            namespace: "user".into(),
+                        },
+                        SubjectSelector::AnyObject {
+                            namespace: "service".into(),
+                        },
+                        SubjectSelector::AnyUserset {
+                            namespace: "group".into(),
+                            relation: "member".into(),
+                        },
+                    ]),
+                },
+            ),
+        )
+        .build();
+    let published = engine
+        .put_schema(&tenant, SchemaId(unique_id("schema-subject-page")), schema)
+        .await
+        .expect("publish subject-page schema");
+    engine
+        .bind_schema(&scope, published.schema_ref, None)
+        .await
+        .expect("bind subject-page schema");
+
+    let target = object("document", "guide");
+    let mut updates = (0..129)
+        .map(|index| {
+            TupleUpdate::Add(Tuple {
+                object: target.clone(),
+                relation: "viewer".into(),
+                subject: Subject::Entity(Object {
+                    namespace: "service".into(),
+                    id: format!("indexer-{index:03}"),
+                }),
+            })
+        })
+        .collect::<Vec<_>>();
+    updates.extend([
+        TupleUpdate::Add(Tuple {
+            object: target.clone(),
+            relation: "viewer".into(),
+            subject: user("alice"),
+        }),
+        TupleUpdate::Add(Tuple {
+            object: target.clone(),
+            relation: "viewer".into(),
+            subject: user("bob"),
+        }),
+        TupleUpdate::Add(Tuple {
+            object: target.clone(),
+            relation: "viewer".into(),
+            subject: Subject::Userset {
+                object: object("group", "team"),
+                relation: "member".into(),
+            },
+        }),
+    ]);
+    let written = engine
+        .mutate_tuples(MutateTuplesRequest::new(scope.clone(), updates).unwrap())
+        .await
+        .expect("write mixed-namespace page fixture");
+
+    // This is the Posthorn subject-page shape: object and relation are exact,
+    // while the selected entity namespace is applied by the tuple service.
+    let filter = TupleFilter {
+        object: Some(ObjectFilter::Exact(target.clone())),
+        relation: Some("viewer".into()),
+        subject: None,
+        subject_namespace: None,
+    }
+    .with_subject_namespace("user");
+    let first = engine
+        .read_tuples(
+            ReadTuplesRequest::new(scope.clone())
+                .with_filter(filter.clone())
+                .with_consistency(Consistency::Exact(written.revision))
+                .with_page_size(1)
+                .unwrap(),
+        )
+        .await
+        .expect("read first filtered subject page");
+    assert_eq!(first.revision, written.revision);
+    assert_eq!(first.tuples.len(), 1);
+    assert!(matches!(
+        &first.tuples[0].subject,
+        Subject::Entity(subject) if subject.namespace == "user"
+    ));
+    let continuation = first
+        .next_page_token
+        .clone()
+        .expect("two matching users require a continuation token");
+
+    let mismatched_filter = filter.clone().with_subject_namespace("service");
+    assert!(
+        engine
+            .read_tuples(
+                ReadTuplesRequest::new(scope.clone())
+                    .with_filter(mismatched_filter)
+                    .with_consistency(Consistency::Exact(first.revision))
+                    .with_page_size(1)
+                    .unwrap()
+                    .with_page_token(continuation.clone()),
+            )
+            .await
+            .is_err()
+    );
+
+    engine
+        .mutate_tuples(
+            MutateTuplesRequest::new(
+                scope.clone(),
+                vec![TupleUpdate::Add(Tuple {
+                    object: target.clone(),
+                    relation: "viewer".into(),
+                    subject: user("zz_after_page"),
+                })],
+            )
+            .unwrap(),
+        )
+        .await
+        .expect("write after first page");
+
+    let second = engine
+        .read_tuples(
+            ReadTuplesRequest::new(scope)
+                .with_filter(filter)
+                .with_consistency(Consistency::Exact(first.revision))
+                .with_page_size(1)
+                .unwrap()
+                .with_page_token(continuation),
+        )
+        .await
+        .expect("continue at the first page's authorization revision");
+    assert_eq!(second.revision, first.revision);
+    assert_eq!(second.tuples.len(), 1);
+    assert!(matches!(
+        &second.tuples[0].subject,
+        Subject::Entity(subject) if subject.namespace == "user"
+    ));
+    assert!(second.next_page_token.is_none());
+    let subject_ids = first
+        .tuples
+        .into_iter()
+        .chain(second.tuples)
+        .filter_map(|tuple| match tuple.subject {
+            Subject::Entity(subject) => Some(subject.id),
+            Subject::Userset { .. } | Subject::Public => None,
+        })
+        .collect::<HashSet<_>>();
+    assert_eq!(subject_ids, HashSet::from(["alice".into(), "bob".into()]));
 }
