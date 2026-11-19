@@ -619,6 +619,9 @@ async fn posthorn_subject_page_filters_before_pagination_and_keeps_its_revision(
             },
         }),
     ]);
+    // A bounded sparse scan can return an empty page plus a continuation.
+    // Every page must advance through this finite original fixture.
+    let maximum_pages = updates.len() + 1;
     let written = engine
         .mutate_tuples(MutateTuplesRequest::new(scope.clone(), updates).unwrap())
         .await
@@ -644,11 +647,11 @@ async fn posthorn_subject_page_filters_before_pagination_and_keeps_its_revision(
         .await
         .expect("read first filtered subject page");
     assert_eq!(first.revision, written.revision);
-    assert_eq!(first.tuples.len(), 1);
-    assert!(matches!(
-        &first.tuples[0].subject,
+    assert!(first.tuples.len() <= 1);
+    assert!(first.tuples.iter().all(|tuple| matches!(
+        &tuple.subject,
         Subject::Entity(subject) if subject.namespace == "user"
-    ));
+    )));
     let continuation = first
         .next_page_token
         .clone()
@@ -684,31 +687,46 @@ async fn posthorn_subject_page_filters_before_pagination_and_keeps_its_revision(
         .await
         .expect("write after first page");
 
-    let second = engine
-        .read_tuples(
-            ReadTuplesRequest::new(scope)
-                .with_filter(filter)
-                .with_consistency(Consistency::Exact(first.revision))
-                .with_page_size(1)
-                .unwrap()
-                .with_page_token(continuation),
-        )
-        .await
-        .expect("continue at the first page's authorization revision");
-    assert_eq!(second.revision, first.revision);
-    assert_eq!(second.tuples.len(), 1);
-    assert!(matches!(
-        &second.tuples[0].subject,
-        Subject::Entity(subject) if subject.namespace == "user"
-    ));
-    assert!(second.next_page_token.is_none());
-    let subject_ids = first
-        .tuples
+    let first_revision = first.revision;
+    let mut tuples = first.tuples;
+    let mut next = Some(continuation);
+    let mut seen_tokens = HashSet::new();
+    let mut pages = 1;
+    while let Some(token) = next {
+        assert!(
+            pages < maximum_pages,
+            "cursor did not exhaust the finite fixture"
+        );
+        assert!(seen_tokens.insert(token.clone()), "cursor repeated a token");
+        let page = engine
+            .read_tuples(
+                ReadTuplesRequest::new(scope.clone())
+                    .with_filter(filter.clone())
+                    .with_consistency(Consistency::Exact(first_revision))
+                    .with_page_size(1)
+                    .unwrap()
+                    .with_page_token(token),
+            )
+            .await
+            .expect("continue at the first page's authorization revision");
+        assert_eq!(page.revision, first_revision);
+        assert!(page.tuples.len() <= 1);
+        assert!(page.tuples.iter().all(|tuple| matches!(
+            &tuple.subject,
+            Subject::Entity(subject) if subject.namespace == "user"
+        )));
+        tuples.extend(page.tuples);
+        next = page.next_page_token;
+        pages += 1;
+    }
+    // Exhaust every continuation, including empty sparse pages. The later
+    // zz_after_page write must never enter this original revision's result.
+    assert_eq!(tuples.len(), 2);
+    let subject_ids = tuples
         .into_iter()
-        .chain(second.tuples)
-        .filter_map(|tuple| match tuple.subject {
-            Subject::Entity(subject) => Some(subject.id),
-            Subject::Userset { .. } | Subject::Public => None,
+        .map(|tuple| match tuple.subject {
+            Subject::Entity(subject) => subject.id,
+            _ => panic!("namespace filter returned a non-entity subject"),
         })
         .collect::<HashSet<_>>();
     assert_eq!(subject_ids, HashSet::from(["alice".into(), "bob".into()]));
