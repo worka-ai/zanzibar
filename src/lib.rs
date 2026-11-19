@@ -429,14 +429,26 @@ pub struct TypedTupleFilter<I> {
     pub object: Option<TypedObjectFilter<I>>,
     pub relation: Option<String>,
     pub subject: Option<TypedSubject<I>>,
+    /// Match object subjects in this namespace. Userset subjects do not match.
+    #[serde(default)]
+    pub subject_namespace: Option<String>,
 }
 pub type TupleFilter = TypedTupleFilter<String>;
+impl<I> TypedTupleFilter<I> {
+    /// Match object subjects in `namespace`; userset subjects are excluded.
+    pub fn with_subject_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.subject_namespace = Some(namespace.into());
+        self
+    }
+}
+
 impl<I> Default for TypedTupleFilter<I> {
     fn default() -> Self {
         Self {
             object: None,
             relation: None,
             subject: None,
+            subject_namespace: None,
         }
     }
 }
@@ -787,6 +799,7 @@ mod tests {
                 object: Some(ObjectFilter::Namespace("document".into())),
                 relation: Some("viewer".into()),
                 subject: Some(Subject::Entity(object("user", "alice"))),
+                subject_namespace: Some("user".into()),
             })
             .with_consistency(Consistency::AtLeast(AuthzRevision(42)))
             .with_page_size(250)
@@ -796,6 +809,7 @@ mod tests {
         assert_eq!(request.page_size, 250);
         assert_eq!(request.page_token.as_deref(), Some("next"));
         assert_eq!(request.consistency, Consistency::AtLeast(AuthzRevision(42)));
+        assert_eq!(request.filter.subject_namespace.as_deref(), Some("user"));
         assert!(matches!(
             request.filter.object,
             Some(ObjectFilter::Namespace(ref namespace)) if namespace == "document"
@@ -950,6 +964,7 @@ mod tests {
                 object: Some(ep::ObjectFilter::Exact(resource)),
                 relation: Some("reader".into()),
                 subject: Some(userset),
+                ..Default::default()
             });
         let page = ep::ReadTuplesPage {
             tuples: vec![tuple.clone()],

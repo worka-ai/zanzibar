@@ -73,6 +73,7 @@ fn mixed_tuple_mutations_filters_checks_and_usersets_preserve_identity() {
             object: Some(typed::ObjectFilter::Exact(object.clone())),
             relation: Some("viewer".into()),
             subject: Some(subject.clone()),
+            subject_namespace: Some("user".into()),
         });
         assert_eq!(
             filter.object.take().unwrap().selection,
@@ -83,6 +84,7 @@ fn mixed_tuple_mutations_filters_checks_and_usersets_preserve_identity() {
             subject
         );
         assert_eq!(filter.relation.take().as_deref(), Some("viewer"));
+        assert_eq!(filter.subject_namespace.take().as_deref(), Some("user"));
         assert_eq!(
             filter,
             ProtoTupleFilter::default(),

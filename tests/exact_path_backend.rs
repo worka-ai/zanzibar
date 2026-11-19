@@ -237,6 +237,7 @@ async fn exact_paths_round_trip_through_schema_mutation_reads_and_checks() {
                     object: Some(ep::ObjectFilter::Exact(document.clone())),
                     relation: Some("viewer".into()),
                     subject: Some(viewers),
+                    ..Default::default()
                 }),
         )
         .await

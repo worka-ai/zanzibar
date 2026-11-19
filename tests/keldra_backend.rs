@@ -432,6 +432,7 @@ async fn distinct_mutations_update_relationships_and_tuple_reads_paginate() {
         object: Some(ObjectFilter::Exact(object("document", "guide"))),
         relation: Some("viewer".into()),
         subject: None,
+        ..Default::default()
     };
     let first_page = engine
         .read_tuples(
