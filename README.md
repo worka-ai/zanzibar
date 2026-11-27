@@ -4,7 +4,7 @@ Model application authorization as relationships, then let Keldra answer the
 question that matters: **may this subject perform this action on this object?**
 
 `zanzibar` is a typed Rust API for schemas, relationship tuples, consistency,
-and permission checks backed by Keldra 0.22.0. It suits applications whose access
+and permission checks backed by Keldra 0.25.0. It suits applications whose access
 rules grow beyond a role column: shared documents, nested teams, delegated
 administration, tenant resources, public objects, and other relationship-based
 policies.
@@ -20,7 +20,8 @@ refresh, exact schema bindings, atomic tuple mutations, and typed results.
 | Direct relations and derived permissions | Yes |
 | Entity, userset, same-resource, exact, and public subject selectors | Yes |
 | Nested userset evaluation | Yes |
-| Atomic add/remove batches with idempotent retries | Yes, up to 1,000 mutations |
+| Opaque and exact-path identities, including mixed tuples and schema selectors | Yes |
+| Atomic add/remove batches | Yes, up to 1,000 mutations |
 | Single and ordered batch permission checks | Yes, up to 1,000 checks |
 | Latest, at-least, and exact-revision consistency | Yes |
 | Filtered, revision-pinned tuple pagination | Yes |
@@ -29,11 +30,11 @@ refresh, exact schema bindings, atomic tuple mutations, and typed results.
 ## Install
 
 ```sh
-cargo add zanzibar@0.8.3
+cargo add zanzibar@0.8.7
 cargo add tokio --features macros,rt-multi-thread
 ```
 
-The adapter targets Keldra 0.22.0. Start Keldra and provision a tenant owner by
+The adapter targets Keldra 0.25.0. Start Keldra and provision a tenant owner by
 following Keldra's [five-minute setup](https://github.com/worka-ai/keldra#your-first-object-in-five-minutes).
 That flow gives the application three values:
 
@@ -125,7 +126,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let written = engine
         .mutate_tuples(MutateTuplesRequest::new(
             scope.clone(),
-            "grant-roadmap-alice-v1",
             vec![TupleUpdate::Add(Tuple {
                 object: roadmap.clone(),
                 relation: "viewer".into(),
@@ -158,6 +158,54 @@ the data being protected.
 
 ## Schemas and relationships
 
+### Exact-path resources
+
+Existing top-level models and `keldra::KeldraRebacEngine` keep their opaque
+`String` IDs. Use the additive `exact_path` models and engine when a graph
+contains path-addressed resources. This API supports both identity kinds in
+one graph; paths are sent as Keldra's native `ExactPath`, never opaque strings.
+
+The existing model names are now concrete aliases of the shared typed models.
+Struct literals and qualified variants (`Subject::Entity`, `TupleUpdate::Add`)
+are unchanged. Rust cannot import enum variants through a type alias: callers
+using `use zanzibar::Subject::{Entity, Public}` must instead use qualified
+variants, or import variants from `zanzibar::TypedSubject`. No identity or
+serialization conversion is needed for existing opaque-ID values.
+
+```rust,no_run
+use zanzibar::{AuthzScope, Consistency, ObjectId, RebacEngine};
+use zanzibar::exact_path::{CheckRequest, KeldraRebacEngine, Object, Subject};
+
+async fn can_read(engine: &KeldraRebacEngine) -> Result<bool, zanzibar::RebacError> {
+    let scope = AuthzScope::new("example", "documents");
+    let decision = engine.check(&scope, CheckRequest {
+        subject: Subject::Entity(Object {
+            namespace: "user".into(),
+            id: ObjectId::Opaque("alice".into()),
+        }),
+        relation: "can_read".into(),
+        object: Object {
+            namespace: "document".into(),
+            id: ObjectId::ExactPath {
+                tenant: "example".into(),
+                bucket: "documents".into(),
+                path: "folders/report.json".into(),
+            },
+        },
+    }, Consistency::Latest).await?;
+    Ok(decision.allowed)
+}
+```
+
+Connect this engine using the same `KeldraRebacConfig` and `connect` method.
+Use `exact_path` aliases consistently for schemas, tuples, reads and checks.
+Exact addresses explicitly retain tenant, bucket and relative path, including
+in usersets and exact subject selectors. Keldra enforces its existing scope
+and address rules; this adapter does not reinterpret or redirect an address.
+The legacy opaque-only reader reports an error if a response contains an
+exact path it cannot represent. For object-plus-tuple atomic writes, use the
+official `keldra` client's existing `AtomicWrite` API.
+
 A direct relation accepts stored tuples. Its selectors say which typed subjects
 are legal. A permission is derived from direct relations or other permissions:
 
@@ -170,7 +218,7 @@ are legal. A permission is derived from direct relations or other permissions:
   remain private by default.
 
 Schemas are immutable and content-addressed by their returned `SchemaRef`.
-Publishing identical content is an idempotent replay. Binding uses a generation
+Publishing identical content returns the existing schema reference. Binding uses a generation
 check, so schema changes cannot silently overwrite a concurrent update.
 
 ## Consistency, batching, and retries
@@ -183,23 +231,25 @@ Every tuple mutation and permission decision returns an `AuthzRevision`:
 - `Consistency::Exact(revision)` evaluates only that current revision and fails
   if it is no longer retained.
 
-`MutateTuplesRequest` requires a caller-generated operation ID and a non-empty
-batch. Reuse an operation ID only when retrying the **same** logical batch; a new
-add or remove needs a new ID. Keldra applies up to 1,000 mutations atomically and
-returns whether the call was replayed. `check_many` evaluates up to 1,000 checks
-at one revision while preserving request order.
+`MutateTuplesRequest` requires a non-empty batch. Keldra applies up to 1,000
+mutations atomically. An expected revision can protect changes against concurrent
+updates. An optional `with_operation_id` enables five-minute, RAM-only retry
+deduplication; it does not survive server restart. Without an ID or after that
+window, read current state after an uncertain response before retrying.
+`check_many` evaluates
+up to 1,000 checks at one revision while preserving request order.
 
 Tuple reads are filtered and paginated. A continuation token pins its filters
 and revision, preventing a multi-page result from drifting silently.
 
 ## Current scope
 
-This release models opaque authorization object IDs. Keldra exact-path object
-references are not yet exposed by this crate. Object/subject discovery and
-ordered tuple watches are also outside the API; applications can use paged
+Both opaque and exact-path authorization object IDs are supported through the
+models described above. Object/subject discovery and ordered tuple watches
+are outside the API; applications can use paged
 tuple reads for bounded inspection.
 
-With Keldra 0.22.0, create and bind new custom realms while one cluster node is
+With Keldra 0.25.0, create and bind new custom realms while one cluster node is
 active, then expand the cluster. Existing bound realms continue to operate
 across the cluster.
 

@@ -3,12 +3,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex;
-use zanzibar::keldra::{KeldraRebacConfig, KeldraRebacEngine};
+use zanzibar::keldra::{KeldraRebacConfig, KeldraRebacEngine, KeldraTenantId};
 use zanzibar::{
-    AuthzScope, CheckRequest, Consistency, KeldraStorageTenantId, MutateTuplesRequest,
-    NamespaceDefinition, Object, ObjectFilter, PermissionRule, ReadTuplesRequest, RebacEngine,
-    RebacError, RelationDefinition, Schema, SchemaBuilder, SchemaId, Subject, SubjectSelector,
-    Tuple, TupleFilter, TupleUpdate,
+    AuthzScope, CheckRequest, Consistency, MutateTuplesRequest, NamespaceDefinition, Object,
+    ObjectFilter, PermissionRule, ReadTuplesRequest, RebacEngine, RebacError, RelationDefinition,
+    Schema, SchemaBuilder, SchemaId, StorageTenantId, Subject, SubjectSelector, Tuple, TupleFilter,
+    TupleUpdate,
 };
 
 static KELDRA_E2E_LOCK: Mutex<()> = Mutex::const_new(());
@@ -143,12 +143,11 @@ fn selector_and_traversal_schema() -> Schema {
         .build()
 }
 
-async fn engine() -> (KeldraRebacEngine, KeldraStorageTenantId) {
+async fn engine() -> (KeldraRebacEngine, KeldraTenantId) {
     let endpoint = std::env::var("KELDRA_E2E_GRPC")
         .expect("KELDRA_E2E_GRPC must point to a Keldra 0.20.0 public endpoint");
-    let storage_tenant = KeldraStorageTenantId(
-        std::env::var("KELDRA_E2E_TENANT").expect("KELDRA_E2E_TENANT must be set"),
-    );
+    let storage_tenant =
+        KeldraTenantId(std::env::var("KELDRA_E2E_TENANT").expect("KELDRA_E2E_TENANT must be set"));
     let client_id =
         std::env::var("KELDRA_E2E_CLIENT_ID").expect("KELDRA_E2E_CLIENT_ID must be set");
     let client_secret =
@@ -165,14 +164,10 @@ async fn engine() -> (KeldraRebacEngine, KeldraStorageTenantId) {
     (engine, storage_tenant)
 }
 
-async fn publish_and_bind(
-    engine: &KeldraRebacEngine,
-    tenant: &KeldraStorageTenantId,
-    scope: &AuthzScope,
-) {
+async fn publish_and_bind(engine: &KeldraRebacEngine, tenant: &KeldraTenantId, scope: &AuthzScope) {
     let published = engine
         .put_schema(
-            tenant,
+            &StorageTenantId(tenant.0.clone()),
             SchemaId(unique_id("schema")),
             authorization_schema(),
         )
@@ -191,23 +186,32 @@ async fn schema_lifecycle_and_server_side_checks_use_one_revision() {
     let (engine, tenant) = engine().await;
     let schema = authorization_schema();
     let schema_id = SchemaId(unique_id("schema-lifecycle"));
-    let scope = AuthzScope::new(tenant.clone(), unique_id("realm-lifecycle"));
+    let scope = AuthzScope::new(
+        StorageTenantId(tenant.0.clone()),
+        unique_id("realm-lifecycle"),
+    );
 
     let published = engine
-        .put_schema(&tenant, schema_id.clone(), schema.clone())
+        .put_schema(
+            &StorageTenantId(tenant.0.clone()),
+            schema_id.clone(),
+            schema.clone(),
+        )
         .await
         .expect("publish schema");
-    assert!(!published.replayed);
 
-    let replay = engine
-        .put_schema(&tenant, schema_id, schema.clone())
+    let identical = engine
+        .put_schema(
+            &StorageTenantId(tenant.0.clone()),
+            schema_id,
+            schema.clone(),
+        )
         .await
-        .expect("replay identical schema publication");
-    assert!(replay.replayed);
-    assert_eq!(replay.schema_ref, published.schema_ref);
+        .expect("publish identical schema content");
+    assert_eq!(identical.schema_ref, published.schema_ref);
 
     let (loaded_ref, loaded_schema) = engine
-        .get_schema(&tenant, &published.schema_ref)
+        .get_schema(&StorageTenantId(tenant.0.clone()), &published.schema_ref)
         .await
         .expect("load the exact immutable schema");
     assert_eq!(loaded_ref, published.schema_ref);
@@ -238,7 +242,6 @@ async fn schema_lifecycle_and_server_side_checks_use_one_revision() {
     );
     let mutation = MutateTuplesRequest::new(
         scope.clone(),
-        unique_id("grant-userset"),
         vec![
             TupleUpdate::Add(group_members),
             TupleUpdate::Add(document_viewers),
@@ -289,10 +292,13 @@ async fn exact_same_resource_public_and_tuple_to_userset_work_end_to_end() {
     let _guard = KELDRA_E2E_LOCK.lock().await;
     let (engine, tenant) = engine().await;
     let schema = selector_and_traversal_schema();
-    let scope = AuthzScope::new(tenant.clone(), unique_id("realm-selectors"));
+    let scope = AuthzScope::new(
+        StorageTenantId(tenant.0.clone()),
+        unique_id("realm-selectors"),
+    );
     let published = engine
         .put_schema(
-            &tenant,
+            &StorageTenantId(tenant.0.clone()),
             SchemaId(unique_id("schema-selectors")),
             schema.clone(),
         )
@@ -303,7 +309,7 @@ async fn exact_same_resource_public_and_tuple_to_userset_work_end_to_end() {
         .await
         .expect("bind selector and traversal schema");
     let (_, loaded) = engine
-        .get_schema(&tenant, &published.schema_ref)
+        .get_schema(&StorageTenantId(tenant.0.clone()), &published.schema_ref)
         .await
         .expect("load canonical selector and traversal schema");
     assert_eq!(loaded, schema);
@@ -312,7 +318,6 @@ async fn exact_same_resource_public_and_tuple_to_userset_work_end_to_end() {
         .mutate_tuples(
             MutateTuplesRequest::new(
                 scope.clone(),
-                unique_id("selector-and-traversal-tuples"),
                 vec![
                     TupleUpdate::Add(Tuple {
                         object: object("folder", "engineering"),
@@ -378,36 +383,29 @@ async fn exact_same_resource_public_and_tuple_to_userset_work_end_to_end() {
 
 #[tokio::test]
 #[ignore = "requires KELDRA_E2E_GRPC, KELDRA_E2E_TENANT, KELDRA_E2E_CLIENT_ID and KELDRA_E2E_CLIENT_SECRET"]
-async fn distinct_mutations_survive_replay_and_tuple_reads_paginate() {
+async fn distinct_mutations_update_relationships_and_tuple_reads_paginate() {
     let _guard = KELDRA_E2E_LOCK.lock().await;
     let (engine, tenant) = engine().await;
-    let scope = AuthzScope::new(tenant.clone(), unique_id("realm-mutations"));
+    let scope = AuthzScope::new(
+        StorageTenantId(tenant.0.clone()),
+        unique_id("realm-mutations"),
+    );
     publish_and_bind(&engine, &tenant, &scope).await;
 
     let alice_viewer = tuple("guide", "viewer", user("alice"));
-    let first_add = MutateTuplesRequest::new(
-        scope.clone(),
-        unique_id("add-alice-first"),
-        vec![TupleUpdate::Add(alice_viewer.clone())],
-    )
-    .unwrap();
+    let first_add =
+        MutateTuplesRequest::new(scope.clone(), vec![TupleUpdate::Add(alice_viewer.clone())])
+            .unwrap();
     let added = engine
-        .mutate_tuples(first_add.clone())
-        .await
-        .expect("add relationship");
-    let replayed = engine
         .mutate_tuples(first_add)
         .await
-        .expect("replay the same logical operation");
-    assert!(replayed.replayed);
-    assert_eq!(replayed.revision, added.revision);
-    assert!(replayed.replay_guarantee_expires_at.is_some());
+        .expect("add relationship");
+    assert!(added.revision.0 > 0);
 
     engine
         .mutate_tuples(
             MutateTuplesRequest::new(
                 scope.clone(),
-                unique_id("remove-alice"),
                 vec![TupleUpdate::Remove(alice_viewer.clone())],
             )
             .unwrap(),
@@ -428,11 +426,10 @@ async fn distinct_mutations_survive_replay_and_tuple_reads_paginate() {
         .expect("check removed relationship");
     assert!(!removed.allowed);
 
-    engine
+    let added_again = engine
         .mutate_tuples(
             MutateTuplesRequest::new(
                 scope.clone(),
-                unique_id("add-alice-second"),
                 vec![
                     TupleUpdate::Add(alice_viewer),
                     TupleUpdate::Add(tuple("guide", "viewer", user("bob"))),
@@ -441,17 +438,19 @@ async fn distinct_mutations_survive_replay_and_tuple_reads_paginate() {
             .unwrap(),
         )
         .await
-        .expect("add the relationship again with a distinct operation ID");
+        .expect("add the relationship again after removal");
 
     let filter = TupleFilter {
         object: Some(ObjectFilter::Exact(object("document", "guide"))),
         relation: Some("viewer".into()),
         subject: None,
+        ..Default::default()
     };
     let first_page = engine
         .read_tuples(
             ReadTuplesRequest::new(scope.clone())
                 .with_filter(filter.clone())
+                .with_consistency(Consistency::AtLeast(added_again.revision))
                 .with_page_size(1)
                 .unwrap(),
         )
@@ -492,10 +491,13 @@ async fn distinct_mutations_survive_replay_and_tuple_reads_paginate() {
 async fn invalid_batches_are_atomic_and_tenant_mismatches_fail_closed() {
     let _guard = KELDRA_E2E_LOCK.lock().await;
     let (engine, tenant) = engine().await;
-    let scope = AuthzScope::new(tenant.clone(), unique_id("realm-atomicity"));
+    let scope = AuthzScope::new(
+        StorageTenantId(tenant.0.clone()),
+        unique_id("realm-atomicity"),
+    );
     publish_and_bind(&engine, &tenant, &scope).await;
 
-    let empty = MutateTuplesRequest::new(scope.clone(), unique_id("empty"), Vec::new());
+    let empty = MutateTuplesRequest::new(scope.clone(), Vec::new());
     assert!(matches!(empty, Err(RebacError::InvalidMutation(_))));
 
     let valid_tuple = tuple("atomic", "viewer", user("alice"));
@@ -508,7 +510,6 @@ async fn invalid_batches_are_atomic_and_tenant_mismatches_fail_closed() {
         .mutate_tuples(
             MutateTuplesRequest::new(
                 scope.clone(),
-                unique_id("invalid-atomic-batch"),
                 vec![
                     TupleUpdate::Add(valid_tuple),
                     TupleUpdate::Add(invalid_tuple),
@@ -548,4 +549,207 @@ async fn invalid_batches_are_atomic_and_tenant_mismatches_fail_closed() {
         .await
         .expect_err("a scope cannot switch the authenticated storage tenant");
     assert!(matches!(mismatch, RebacError::PermissionDenied(_)));
+}
+
+#[tokio::test]
+#[ignore = "requires KELDRA_E2E_GRPC, KELDRA_E2E_TENANT, KELDRA_E2E_CLIENT_ID and KELDRA_E2E_CLIENT_SECRET"]
+async fn posthorn_subject_page_filters_before_pagination_and_keeps_its_revision() {
+    let _guard = KELDRA_E2E_LOCK.lock().await;
+    let (engine, tenant) = engine().await;
+    let scope = AuthzScope::new(
+        StorageTenantId(tenant.0.clone()),
+        unique_id("realm-subject-page"),
+    );
+    let schema = SchemaBuilder::new()
+        .namespace("user", NamespaceDefinition::new())
+        .namespace("service", NamespaceDefinition::new())
+        .namespace(
+            "group",
+            NamespaceDefinition::new().relation(
+                "member",
+                RelationDefinition::Direct {
+                    allowed_subjects: BTreeSet::from([SubjectSelector::AnyObject {
+                        namespace: "user".into(),
+                    }]),
+                },
+            ),
+        )
+        .namespace(
+            "document",
+            NamespaceDefinition::new().relation(
+                "viewer",
+                RelationDefinition::Direct {
+                    allowed_subjects: BTreeSet::from([
+                        SubjectSelector::AnyObject {
+                            namespace: "user".into(),
+                        },
+                        SubjectSelector::AnyObject {
+                            namespace: "service".into(),
+                        },
+                        SubjectSelector::AnyUserset {
+                            namespace: "group".into(),
+                            relation: "member".into(),
+                        },
+                    ]),
+                },
+            ),
+        )
+        .build();
+    let published = engine
+        .put_schema(
+            &StorageTenantId(tenant.0.clone()),
+            SchemaId(unique_id("schema-subject-page")),
+            schema,
+        )
+        .await
+        .expect("publish subject-page schema");
+    engine
+        .bind_schema(&scope, published.schema_ref, None)
+        .await
+        .expect("bind subject-page schema");
+
+    let target = object("document", "guide");
+    let mut updates = (0..129)
+        .map(|index| {
+            TupleUpdate::Add(Tuple {
+                object: target.clone(),
+                relation: "viewer".into(),
+                subject: Subject::Entity(Object {
+                    namespace: "service".into(),
+                    id: format!("indexer-{index:03}"),
+                }),
+            })
+        })
+        .collect::<Vec<_>>();
+    updates.extend([
+        TupleUpdate::Add(Tuple {
+            object: target.clone(),
+            relation: "viewer".into(),
+            subject: user("alice"),
+        }),
+        TupleUpdate::Add(Tuple {
+            object: target.clone(),
+            relation: "viewer".into(),
+            subject: user("bob"),
+        }),
+        TupleUpdate::Add(Tuple {
+            object: target.clone(),
+            relation: "viewer".into(),
+            subject: Subject::Userset {
+                object: object("group", "team"),
+                relation: "member".into(),
+            },
+        }),
+    ]);
+    // A bounded sparse scan can return an empty page plus a continuation.
+    // Every page must advance through this finite original fixture.
+    let maximum_pages = updates.len() + 1;
+    let written = engine
+        .mutate_tuples(MutateTuplesRequest::new(scope.clone(), updates).unwrap())
+        .await
+        .expect("write mixed-namespace page fixture");
+
+    // This is the Posthorn subject-page shape: object and relation are exact,
+    // while the selected entity namespace is applied by the tuple service.
+    let filter = TupleFilter {
+        object: Some(ObjectFilter::Exact(target.clone())),
+        relation: Some("viewer".into()),
+        subject: None,
+        subject_namespace: None,
+    }
+    .with_subject_namespace("user");
+    let first = engine
+        .read_tuples(
+            ReadTuplesRequest::new(scope.clone())
+                .with_filter(filter.clone())
+                .with_consistency(Consistency::Exact(written.revision))
+                .with_page_size(1)
+                .unwrap(),
+        )
+        .await
+        .expect("read first filtered subject page");
+    assert_eq!(first.revision, written.revision);
+    assert!(first.tuples.len() <= 1);
+    assert!(first.tuples.iter().all(|tuple| matches!(
+        &tuple.subject,
+        Subject::Entity(subject) if subject.namespace == "user"
+    )));
+    let continuation = first
+        .next_page_token
+        .clone()
+        .expect("two matching users require a continuation token");
+
+    let mismatched_filter = filter.clone().with_subject_namespace("service");
+    assert!(
+        engine
+            .read_tuples(
+                ReadTuplesRequest::new(scope.clone())
+                    .with_filter(mismatched_filter)
+                    .with_consistency(Consistency::Exact(first.revision))
+                    .with_page_size(1)
+                    .unwrap()
+                    .with_page_token(continuation.clone()),
+            )
+            .await
+            .is_err()
+    );
+
+    engine
+        .mutate_tuples(
+            MutateTuplesRequest::new(
+                scope.clone(),
+                vec![TupleUpdate::Add(Tuple {
+                    object: target.clone(),
+                    relation: "viewer".into(),
+                    subject: user("zz_after_page"),
+                })],
+            )
+            .unwrap(),
+        )
+        .await
+        .expect("write after first page");
+
+    let first_revision = first.revision;
+    let mut tuples = first.tuples;
+    let mut next = Some(continuation);
+    let mut seen_tokens = HashSet::new();
+    let mut pages = 1;
+    while let Some(token) = next {
+        assert!(
+            pages < maximum_pages,
+            "cursor did not exhaust the finite fixture"
+        );
+        assert!(seen_tokens.insert(token.clone()), "cursor repeated a token");
+        let page = engine
+            .read_tuples(
+                ReadTuplesRequest::new(scope.clone())
+                    .with_filter(filter.clone())
+                    .with_consistency(Consistency::Exact(first_revision))
+                    .with_page_size(1)
+                    .unwrap()
+                    .with_page_token(token),
+            )
+            .await
+            .expect("continue at the first page's authorization revision");
+        assert_eq!(page.revision, first_revision);
+        assert!(page.tuples.len() <= 1);
+        assert!(page.tuples.iter().all(|tuple| matches!(
+            &tuple.subject,
+            Subject::Entity(subject) if subject.namespace == "user"
+        )));
+        tuples.extend(page.tuples);
+        next = page.next_page_token;
+        pages += 1;
+    }
+    // Exhaust every continuation, including empty sparse pages. The later
+    // zz_after_page write must never enter this original revision's result.
+    assert_eq!(tuples.len(), 2);
+    let subject_ids = tuples
+        .into_iter()
+        .map(|tuple| match tuple.subject {
+            Subject::Entity(subject) => subject.id,
+            _ => panic!("namespace filter returned a non-entity subject"),
+        })
+        .collect::<HashSet<_>>();
+    assert_eq!(subject_ids, HashSet::from(["alice".into(), "bob".into()]));
 }
