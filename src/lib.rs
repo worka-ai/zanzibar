@@ -673,6 +673,29 @@ pub trait RebacEngine<I: Send + Sync + 'static = String>: Send + Sync {
     ) -> Result<CheckManyResult, RebacError>;
 }
 
+/// PostgreSQL transaction-aware extension to the provider-neutral Zanzibar
+/// contract. These methods use the engine's regular validation and mutation
+/// logic while leaving commit or rollback to the caller.
+#[cfg(feature = "postgres")]
+#[async_trait]
+pub trait PostgresTransactionalRebacEngine<I: Send + Sync + 'static = String>:
+    RebacEngine<I>
+{
+    async fn mutate_tuples_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        request: TypedMutateTuplesRequest<I>,
+    ) -> Result<MutateTuplesResult, RebacError>;
+
+    async fn check_many_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        scope: &AuthzScope,
+        requests: Vec<TypedCheckRequest<I>>,
+        consistency: Consistency,
+    ) -> Result<CheckManyResult, RebacError>;
+}
+
 pub async fn put_and_bind_schema<I: Send + Sync + 'static>(
     engine: &dyn RebacEngine<I>,
     scope: &AuthzScope,

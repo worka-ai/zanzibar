@@ -461,185 +461,10 @@ where
         &self,
         request: TypedMutateTuplesRequest<I>,
     ) -> Result<MutateTuplesResult, RebacError> {
-        let (scope, operation_id, expected_revision, updates) =
-            request.into_parts_with_operation_id();
-        if updates.is_empty() || updates.len() > MAX_MUTATIONS_PER_REQUEST {
-            return Err(RebacError::InvalidMutation(format!(
-                "tuple mutation must contain 1 to {MAX_MUTATIONS_PER_REQUEST} updates"
-            )));
-        }
-        if operation_id
-            .as_ref()
-            .is_some_and(|id| id.is_empty() || id.len() > MAX_OPERATION_ID_BYTES)
-        {
-            return Err(RebacError::InvalidMutation(format!(
-                "operation ID must contain 1 to {MAX_OPERATION_ID_BYTES} bytes"
-            )));
-        }
-        let payload = serde_json::to_vec(&(&scope, expected_revision, &updates)).map_err(|_| {
-            RebacError::InvalidMutation("tuple mutation could not be encoded".into())
-        })?;
-        let payload_digest: [u8; 32] = Sha256::digest(payload).into();
-
         let mut tx = self.pool.begin().await?;
-        self.lock_scope(&mut tx, &scope).await?;
-        if let Some(operation_id) = operation_id.as_deref() {
-            let key = format!(
-                "operation:{}:{}:{operation_id}",
-                scope.storage_tenant_id.0, scope.authz_realm_id.0
-            );
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-                .bind(key)
-                .execute(&mut *tx)
-                .await?;
-            let receipt_sql = format!(
-                "SELECT payload_digest, result_revision FROM {} \
-                 WHERE storage_tenant_id = $1 AND authz_realm_id = $2 AND operation_id = $3",
-                self.table("operation_receipt")
-            );
-            if let Some(row) = sqlx::query(&receipt_sql)
-                .bind(&scope.storage_tenant_id.0)
-                .bind(&scope.authz_realm_id.0)
-                .bind(operation_id)
-                .fetch_optional(&mut *tx)
-                .await?
-            {
-                let old_digest: Vec<u8> = row.try_get("payload_digest")?;
-                if old_digest.as_slice() != payload_digest {
-                    return Err(RebacError::Conflict(
-                        "operation ID was already used for a different tuple mutation".into(),
-                    ));
-                }
-                let revision =
-                    i64_to_u64(row.try_get("result_revision")?, "authorization revision")?;
-                tx.commit().await?;
-                return Ok(MutateTuplesResult {
-                    revision: AuthzRevision(revision),
-                    replayed: true,
-                    replay_guarantee_expires_at: None,
-                });
-            }
-        }
-
-        let latest = self
-            .latest_revision(&mut tx, &scope.storage_tenant_id)
-            .await?;
-        if let Some(expected) = expected_revision
-            && expected.0 != latest
-        {
-            return Err(RebacError::Conflict(format!(
-                "expected authorization revision {}, found {latest}",
-                expected.0
-            )));
-        }
-        let binding = self
-            .current_binding(&mut tx, &scope)
-            .await?
-            .ok_or_else(|| RebacError::SchemaBindingNotFound(scope.clone()))?;
-        let schema = self
-            .schema_by_ref(&mut tx, &scope.storage_tenant_id, &binding.schema_ref)
-            .await?;
-        for update in &updates {
-            let tuple = match update {
-                TypedTupleUpdate::Add(tuple) | TypedTupleUpdate::Remove(tuple) => tuple,
-            };
-            validate_tuple(&schema, tuple)?;
-        }
-
-        let revision = self
-            .advance_revision(&mut tx, &scope.storage_tenant_id)
-            .await?;
-        for update in updates {
-            match update {
-                TypedTupleUpdate::Add(tuple) => {
-                    let fields = tuple_fields(&tuple)?;
-                    let exists_sql = format!(
-                        "SELECT EXISTS (SELECT 1 FROM {} WHERE storage_tenant_id=$1 AND authz_realm_id=$2 \
-                         AND object_namespace=$3 AND object_id_json=$4 AND relation=$5 AND subject_kind=$6 \
-                         AND subject_namespace=$7 AND subject_id_json=$8 AND subject_relation=$9 \
-                         AND removed_revision IS NULL)",
-                        self.table("tuple_history")
-                    );
-                    let exists: bool = sqlx::query_scalar(&exists_sql)
-                        .bind(&scope.storage_tenant_id.0)
-                        .bind(&scope.authz_realm_id.0)
-                        .bind(&fields.0)
-                        .bind(&fields.1)
-                        .bind(&fields.2)
-                        .bind(&fields.3)
-                        .bind(&fields.4)
-                        .bind(&fields.5)
-                        .bind(&fields.6)
-                        .fetch_one(&mut *tx)
-                        .await?;
-                    if !exists {
-                        let insert_sql = format!(
-                            "INSERT INTO {} (storage_tenant_id,authz_realm_id,object_namespace,object_id_json,relation, \
-                             subject_kind,subject_namespace,subject_id_json,subject_relation,added_revision) \
-                             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
-                            self.table("tuple_history")
-                        );
-                        sqlx::query(&insert_sql)
-                            .bind(&scope.storage_tenant_id.0)
-                            .bind(&scope.authz_realm_id.0)
-                            .bind(&fields.0)
-                            .bind(&fields.1)
-                            .bind(&fields.2)
-                            .bind(&fields.3)
-                            .bind(&fields.4)
-                            .bind(&fields.5)
-                            .bind(&fields.6)
-                            .bind(u64_to_i64(revision, "authorization revision")?)
-                            .execute(&mut *tx)
-                            .await?;
-                    }
-                }
-                TypedTupleUpdate::Remove(tuple) => {
-                    let fields = tuple_fields(&tuple)?;
-                    let remove_sql = format!(
-                        "UPDATE {} SET removed_revision=$10 WHERE storage_tenant_id=$1 AND authz_realm_id=$2 \
-                         AND object_namespace=$3 AND object_id_json=$4 AND relation=$5 AND subject_kind=$6 \
-                         AND subject_namespace=$7 AND subject_id_json=$8 AND subject_relation=$9 \
-                         AND removed_revision IS NULL",
-                        self.table("tuple_history")
-                    );
-                    sqlx::query(&remove_sql)
-                        .bind(&scope.storage_tenant_id.0)
-                        .bind(&scope.authz_realm_id.0)
-                        .bind(&fields.0)
-                        .bind(&fields.1)
-                        .bind(&fields.2)
-                        .bind(&fields.3)
-                        .bind(&fields.4)
-                        .bind(&fields.5)
-                        .bind(&fields.6)
-                        .bind(u64_to_i64(revision, "authorization revision")?)
-                        .execute(&mut *tx)
-                        .await?;
-                }
-            }
-        }
-        if let Some(operation_id) = operation_id {
-            let insert_receipt_sql = format!(
-                "INSERT INTO {} (storage_tenant_id,authz_realm_id,operation_id,payload_digest,result_revision) \
-                 VALUES ($1,$2,$3,$4,$5)",
-                self.table("operation_receipt")
-            );
-            sqlx::query(&insert_receipt_sql)
-                .bind(&scope.storage_tenant_id.0)
-                .bind(&scope.authz_realm_id.0)
-                .bind(operation_id)
-                .bind(payload_digest.as_slice())
-                .bind(u64_to_i64(revision, "authorization revision")?)
-                .execute(&mut *tx)
-                .await?;
-        }
+        let result = self.mutate_tuples_in_transaction(&mut tx, request).await?;
         tx.commit().await?;
-        Ok(MutateTuplesResult {
-            revision: AuthzRevision(revision),
-            replayed: false,
-            replay_guarantee_expires_at: None,
-        })
+        Ok(result)
     }
 
     async fn read_tuples(
@@ -805,6 +630,236 @@ where
         requests: Vec<TypedCheckRequest<I>>,
         consistency: Consistency,
     ) -> Result<CheckManyResult, RebacError> {
+        let mut tx = self.pool.begin().await?;
+        let result = self
+            .check_many_in_transaction(&mut tx, scope, requests, consistency)
+            .await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+}
+
+#[async_trait]
+impl<I> crate::PostgresTransactionalRebacEngine<I> for PostgresRebacEngine<I>
+where
+    I: Serialize + DeserializeOwned + Clone + Eq + Ord + Send + Sync + 'static,
+{
+    async fn mutate_tuples_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        request: TypedMutateTuplesRequest<I>,
+    ) -> Result<MutateTuplesResult, RebacError> {
+        PostgresRebacEngine::mutate_tuples_in_transaction(self, transaction, request).await
+    }
+
+    async fn check_many_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        scope: &AuthzScope,
+        requests: Vec<TypedCheckRequest<I>>,
+        consistency: Consistency,
+    ) -> Result<CheckManyResult, RebacError> {
+        PostgresRebacEngine::check_many_in_transaction(
+            self,
+            transaction,
+            scope,
+            requests,
+            consistency,
+        )
+        .await
+    }
+}
+
+impl<I> PostgresRebacEngine<I>
+where
+    I: Serialize + DeserializeOwned + Clone + Eq + Ord + Send + Sync + 'static,
+{
+    async fn mutate_tuples_in_transaction(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        request: TypedMutateTuplesRequest<I>,
+    ) -> Result<MutateTuplesResult, RebacError> {
+        let (scope, operation_id, expected_revision, updates) =
+            request.into_parts_with_operation_id();
+        if updates.is_empty() || updates.len() > MAX_MUTATIONS_PER_REQUEST {
+            return Err(RebacError::InvalidMutation(format!(
+                "tuple mutation must contain 1 to {MAX_MUTATIONS_PER_REQUEST} updates"
+            )));
+        }
+        if operation_id
+            .as_ref()
+            .is_some_and(|id| id.is_empty() || id.len() > MAX_OPERATION_ID_BYTES)
+        {
+            return Err(RebacError::InvalidMutation(format!(
+                "operation ID must contain 1 to {MAX_OPERATION_ID_BYTES} bytes"
+            )));
+        }
+        let payload = serde_json::to_vec(&(&scope, expected_revision, &updates)).map_err(|_| {
+            RebacError::InvalidMutation("tuple mutation could not be encoded".into())
+        })?;
+        let payload_digest: [u8; 32] = Sha256::digest(payload).into();
+
+        self.lock_scope(tx, &scope).await?;
+        if let Some(operation_id) = operation_id.as_deref() {
+            let key = format!(
+                "operation:{}:{}:{operation_id}",
+                scope.storage_tenant_id.0, scope.authz_realm_id.0
+            );
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(key)
+                .execute(&mut **tx)
+                .await?;
+            let receipt_sql = format!(
+                "SELECT payload_digest, result_revision FROM {} \
+                 WHERE storage_tenant_id = $1 AND authz_realm_id = $2 AND operation_id = $3",
+                self.table("operation_receipt")
+            );
+            if let Some(row) = sqlx::query(&receipt_sql)
+                .bind(&scope.storage_tenant_id.0)
+                .bind(&scope.authz_realm_id.0)
+                .bind(operation_id)
+                .fetch_optional(&mut **tx)
+                .await?
+            {
+                let old_digest: Vec<u8> = row.try_get("payload_digest")?;
+                if old_digest.as_slice() != payload_digest {
+                    return Err(RebacError::Conflict(
+                        "operation ID was already used for a different tuple mutation".into(),
+                    ));
+                }
+                let revision =
+                    i64_to_u64(row.try_get("result_revision")?, "authorization revision")?;
+                return Ok(MutateTuplesResult {
+                    revision: AuthzRevision(revision),
+                    replayed: true,
+                    replay_guarantee_expires_at: None,
+                });
+            }
+        }
+
+        let latest = self.latest_revision(tx, &scope.storage_tenant_id).await?;
+        if let Some(expected) = expected_revision
+            && expected.0 != latest
+        {
+            return Err(RebacError::Conflict(format!(
+                "expected authorization revision {}, found {latest}",
+                expected.0
+            )));
+        }
+        let binding = self
+            .current_binding(tx, &scope)
+            .await?
+            .ok_or_else(|| RebacError::SchemaBindingNotFound(scope.clone()))?;
+        let schema = self
+            .schema_by_ref(tx, &scope.storage_tenant_id, &binding.schema_ref)
+            .await?;
+        for update in &updates {
+            let tuple = match update {
+                TypedTupleUpdate::Add(tuple) | TypedTupleUpdate::Remove(tuple) => tuple,
+            };
+            validate_tuple(&schema, tuple)?;
+        }
+
+        let revision = self.advance_revision(tx, &scope.storage_tenant_id).await?;
+        for update in updates {
+            match update {
+                TypedTupleUpdate::Add(tuple) => {
+                    let fields = tuple_fields(&tuple)?;
+                    let exists_sql = format!(
+                        "SELECT EXISTS (SELECT 1 FROM {} WHERE storage_tenant_id=$1 AND authz_realm_id=$2 \
+                         AND object_namespace=$3 AND object_id_json=$4 AND relation=$5 AND subject_kind=$6 \
+                         AND subject_namespace=$7 AND subject_id_json=$8 AND subject_relation=$9 \
+                         AND removed_revision IS NULL)",
+                        self.table("tuple_history")
+                    );
+                    let exists: bool = sqlx::query_scalar(&exists_sql)
+                        .bind(&scope.storage_tenant_id.0)
+                        .bind(&scope.authz_realm_id.0)
+                        .bind(&fields.0)
+                        .bind(&fields.1)
+                        .bind(&fields.2)
+                        .bind(&fields.3)
+                        .bind(&fields.4)
+                        .bind(&fields.5)
+                        .bind(&fields.6)
+                        .fetch_one(&mut **tx)
+                        .await?;
+                    if !exists {
+                        let insert_sql = format!(
+                            "INSERT INTO {} (storage_tenant_id,authz_realm_id,object_namespace,object_id_json,relation, \
+                             subject_kind,subject_namespace,subject_id_json,subject_relation,added_revision) \
+                             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+                            self.table("tuple_history")
+                        );
+                        sqlx::query(&insert_sql)
+                            .bind(&scope.storage_tenant_id.0)
+                            .bind(&scope.authz_realm_id.0)
+                            .bind(&fields.0)
+                            .bind(&fields.1)
+                            .bind(&fields.2)
+                            .bind(&fields.3)
+                            .bind(&fields.4)
+                            .bind(&fields.5)
+                            .bind(&fields.6)
+                            .bind(u64_to_i64(revision, "authorization revision")?)
+                            .execute(&mut **tx)
+                            .await?;
+                    }
+                }
+                TypedTupleUpdate::Remove(tuple) => {
+                    let fields = tuple_fields(&tuple)?;
+                    let remove_sql = format!(
+                        "UPDATE {} SET removed_revision=$10 WHERE storage_tenant_id=$1 AND authz_realm_id=$2 \
+                         AND object_namespace=$3 AND object_id_json=$4 AND relation=$5 AND subject_kind=$6 \
+                         AND subject_namespace=$7 AND subject_id_json=$8 AND subject_relation=$9 \
+                         AND removed_revision IS NULL",
+                        self.table("tuple_history")
+                    );
+                    sqlx::query(&remove_sql)
+                        .bind(&scope.storage_tenant_id.0)
+                        .bind(&scope.authz_realm_id.0)
+                        .bind(&fields.0)
+                        .bind(&fields.1)
+                        .bind(&fields.2)
+                        .bind(&fields.3)
+                        .bind(&fields.4)
+                        .bind(&fields.5)
+                        .bind(&fields.6)
+                        .bind(u64_to_i64(revision, "authorization revision")?)
+                        .execute(&mut **tx)
+                        .await?;
+                }
+            }
+        }
+        if let Some(operation_id) = operation_id {
+            let insert_receipt_sql = format!(
+                "INSERT INTO {} (storage_tenant_id,authz_realm_id,operation_id,payload_digest,result_revision) \
+                 VALUES ($1,$2,$3,$4,$5)",
+                self.table("operation_receipt")
+            );
+            sqlx::query(&insert_receipt_sql)
+                .bind(&scope.storage_tenant_id.0)
+                .bind(&scope.authz_realm_id.0)
+                .bind(operation_id)
+                .bind(payload_digest.as_slice())
+                .bind(u64_to_i64(revision, "authorization revision")?)
+                .execute(&mut **tx)
+                .await?;
+        }
+        Ok(MutateTuplesResult {
+            revision: AuthzRevision(revision),
+            replayed: false,
+            replay_guarantee_expires_at: None,
+        })
+    }
+
+    async fn check_many_in_transaction(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        scope: &AuthzScope,
+        requests: Vec<TypedCheckRequest<I>>,
+        consistency: Consistency,
+    ) -> Result<CheckManyResult, RebacError> {
         if requests.is_empty() {
             return Err(RebacError::InvalidTuple(
                 "check batch must not be empty".into(),
@@ -815,13 +870,12 @@ where
                 "check batch exceeds 1000 requests".into(),
             ));
         }
-        let mut tx = self.pool.begin().await?;
         let revision = self
-            .revision_for_consistency(&mut tx, &scope.storage_tenant_id, consistency)
+            .revision_for_consistency(tx, &scope.storage_tenant_id, consistency)
             .await?;
-        let binding = self.binding_at_revision(&mut tx, scope, revision).await?;
+        let binding = self.binding_at_revision(tx, scope, revision).await?;
         let schema = self
-            .schema_by_ref(&mut tx, &scope.storage_tenant_id, &binding.schema_ref)
+            .schema_by_ref(tx, &scope.storage_tenant_id, &binding.schema_ref)
             .await?;
         let mut tuple_cache = HashMap::new();
         let mut decisions = Vec::with_capacity(requests.len());
@@ -835,7 +889,7 @@ where
             let mut steps = 0;
             let allowed = self
                 .check_node(
-                    &mut tx,
+                    tx,
                     scope,
                     &schema,
                     &request.object,
@@ -850,18 +904,12 @@ where
                 .await?;
             decisions.push(allowed);
         }
-        tx.commit().await?;
         Ok(CheckManyResult {
             decisions,
             revision: AuthzRevision(revision),
         })
     }
-}
 
-impl<I> PostgresRebacEngine<I>
-where
-    I: Serialize + DeserializeOwned + Clone + Eq + Ord + Send + Sync + 'static,
-{
     async fn active_tuples_in_tx(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -1115,11 +1163,11 @@ where
         let sql = format!(
             "SELECT storage_tenant_id,authz_realm_id,filter_digest,revision,after_object_namespace,after_object_id_json,after_relation, \
              after_subject_kind,after_subject_namespace,after_subject_id_json,after_subject_relation \
-             FROM {} WHERE id=$1 AND expires_at > now()",
+             FROM {} WHERE id=$1::uuid AND expires_at > now()",
             self.table("read_cursor")
         );
         let row = sqlx::query(&sql)
-            .bind(id)
+            .bind(id.to_string())
             .fetch_optional(&mut **tx)
             .await?
             .ok_or_else(|| {

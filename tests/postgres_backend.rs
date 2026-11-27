@@ -8,8 +8,9 @@ use uuid::Uuid;
 use zanzibar::postgres::PostgresRebacEngine;
 use zanzibar::{
     AuthzScope, Consistency, MutateTuplesRequest, Object, ObjectFilter, PermissionRule,
-    ReadTuplesRequest, RebacEngine, RelationDefinition, SchemaBuilder, SchemaId, SchemaRef,
-    StorageTenantId, Subject, SubjectSelector, Tuple, TupleFilter, TupleUpdate,
+    PostgresTransactionalRebacEngine, ReadTuplesRequest, RebacEngine, RelationDefinition,
+    SchemaBuilder, SchemaId, SchemaRef, StorageTenantId, Subject, SubjectSelector, Tuple,
+    TupleFilter, TupleUpdate, TypedCheckRequest,
 };
 
 fn object(namespace: &str, id: &str) -> Object {
@@ -341,6 +342,80 @@ async fn postgres_current_api_preserves_typed_checks_versions_replays_and_cursor
             .await,
         Err(zanzibar::RebacError::InvalidReadRequest(_))
     ));
+
+    clean(pool, &schema_name).await;
+}
+
+#[tokio::test]
+async fn postgres_transaction_extension_uses_the_callers_commit_boundary() {
+    let (engine, pool, schema_name) = engine().await;
+    let scope = AuthzScope::new(StorageTenantId("tenant-transaction".into()), "realm-a");
+    let published = engine
+        .put_schema(&scope.storage_tenant_id, SchemaId("worka".into()), schema())
+        .await
+        .unwrap();
+    engine
+        .bind_schema(&scope, published.schema_ref, None)
+        .await
+        .unwrap();
+
+    let object = object("group", "transactional-group");
+    let subject = entity("user", "transactional-user");
+    let request = MutateTuplesRequest::new(
+        scope.clone(),
+        vec![TupleUpdate::Add(tuple(
+            object.clone(),
+            "member",
+            subject.clone(),
+        ))],
+    )
+    .unwrap()
+    .with_operation_id("worka-transactional-membership")
+    .unwrap();
+    let check = TypedCheckRequest {
+        subject: subject.clone(),
+        relation: "member".into(),
+        object: object.clone(),
+    };
+
+    let mut rolled_back = pool.begin().await.unwrap();
+    engine
+        .mutate_tuples_in_transaction(&mut rolled_back, request.clone())
+        .await
+        .unwrap();
+    rolled_back.rollback().await.unwrap();
+    assert!(
+        !engine
+            .check(&scope, check.clone(), Consistency::Latest)
+            .await
+            .unwrap()
+            .allowed,
+        "a caller rollback removes the tuple and its operation receipt"
+    );
+
+    let mut committed = pool.begin().await.unwrap();
+    engine
+        .mutate_tuples_in_transaction(&mut committed, request)
+        .await
+        .unwrap();
+    let inside = engine
+        .check_many_in_transaction(
+            &mut committed,
+            &scope,
+            vec![check.clone()],
+            Consistency::Latest,
+        )
+        .await
+        .unwrap();
+    assert_eq!(inside.decisions, [true]);
+    committed.commit().await.unwrap();
+    assert!(
+        engine
+            .check(&scope, check, Consistency::Latest)
+            .await
+            .unwrap()
+            .allowed
+    );
 
     clean(pool, &schema_name).await;
 }
