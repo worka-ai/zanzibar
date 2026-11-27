@@ -3,9 +3,9 @@ use std::collections::{BTreeSet, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use zanzibar::exact_path as ep;
-use zanzibar::keldra::KeldraRebacConfig;
+use zanzibar::keldra::{KeldraRebacConfig, KeldraTenantId};
 use zanzibar::{
-    AuthzScope, Consistency, KeldraStorageTenantId, ObjectId, PermissionRule, RebacEngine, SchemaId,
+    AuthzScope, Consistency, ObjectId, PermissionRule, RebacEngine, SchemaId, StorageTenantId,
 };
 
 fn object(namespace: &str, id: ObjectId) -> ep::Object {
@@ -129,7 +129,7 @@ async fn exact_paths_round_trip_through_schema_mutation_reads_and_checks() {
             .await
             .expect("create isolated identity-test bucket");
     }
-    let storage_tenant = KeldraStorageTenantId(tenant.clone());
+    let storage_tenant = KeldraTenantId(tenant.clone());
     let engine = ep::KeldraRebacEngine::connect(KeldraRebacConfig {
         endpoint,
         storage_tenant: storage_tenant.clone(),
@@ -138,7 +138,7 @@ async fn exact_paths_round_trip_through_schema_mutation_reads_and_checks() {
     })
     .await
     .expect("typed backend connection");
-    let scope = AuthzScope::new(storage_tenant.clone(), unique.clone());
+    let scope = AuthzScope::new(StorageTenantId(storage_tenant.0.clone()), unique.clone());
     let service = ep::Subject::Entity(path(
         "service",
         &tenant,
@@ -147,11 +147,18 @@ async fn exact_paths_round_trip_through_schema_mutation_reads_and_checks() {
     ));
     let expected_schema = schema(service.clone());
     let published = engine
-        .put_schema(&storage_tenant, SchemaId(unique), expected_schema.clone())
+        .put_schema(
+            &StorageTenantId(storage_tenant.0.clone()),
+            SchemaId(unique),
+            expected_schema.clone(),
+        )
         .await
         .expect("publish exact-selector schema");
     let (reference, loaded) = engine
-        .get_schema(&storage_tenant, &published.schema_ref)
+        .get_schema(
+            &StorageTenantId(storage_tenant.0.clone()),
+            &published.schema_ref,
+        )
         .await
         .expect("decode exact-selector schema");
     assert_eq!(reference, published.schema_ref);

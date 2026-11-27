@@ -3,6 +3,8 @@
 mod identity;
 pub mod keldra;
 pub use identity::ObjectId;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 
 /// Opt-in models that can mix opaque subjects with exact-path resources.
 /// Legacy root-level model names remain concrete opaque-ID models.
@@ -289,15 +291,15 @@ pub struct TypedCheckRequest<I> {
 pub type CheckRequest = TypedCheckRequest<String>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct KeldraStorageTenantId(pub String);
+pub struct StorageTenantId(pub String);
 
-impl From<&str> for KeldraStorageTenantId {
+impl From<&str> for StorageTenantId {
     fn from(value: &str) -> Self {
         Self(value.to_string())
     }
 }
 
-impl From<String> for KeldraStorageTenantId {
+impl From<String> for StorageTenantId {
     fn from(value: String) -> Self {
         Self(value)
     }
@@ -320,17 +322,17 @@ impl From<String> for AuthzRealmId {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AuthzScope {
-    pub keldra_tenant_id: KeldraStorageTenantId,
+    pub storage_tenant_id: StorageTenantId,
     pub authz_realm_id: AuthzRealmId,
 }
 
 impl AuthzScope {
     pub fn new(
-        keldra_tenant_id: impl Into<KeldraStorageTenantId>,
+        storage_tenant_id: impl Into<StorageTenantId>,
         authz_realm_id: impl Into<AuthzRealmId>,
     ) -> Self {
         Self {
-            keldra_tenant_id: keldra_tenant_id.into(),
+            storage_tenant_id: storage_tenant_id.into(),
             authz_realm_id: authz_realm_id.into(),
         }
     }
@@ -626,14 +628,14 @@ pub struct CheckManyResult {
 pub trait RebacEngine<I: Send + Sync + 'static = String>: Send + Sync {
     async fn put_schema(
         &self,
-        storage_tenant: &KeldraStorageTenantId,
+        storage_tenant: &StorageTenantId,
         schema_id: SchemaId,
         schema: TypedSchema<I>,
     ) -> Result<PutSchemaResult, RebacError>;
 
     async fn get_schema(
         &self,
-        storage_tenant: &KeldraStorageTenantId,
+        storage_tenant: &StorageTenantId,
         schema_ref: &SchemaRef,
     ) -> Result<(SchemaRef, TypedSchema<I>), RebacError>;
 
@@ -679,7 +681,7 @@ pub async fn put_and_bind_schema<I: Send + Sync + 'static>(
     expected_generation: Option<BindingGeneration>,
 ) -> Result<BindSchemaResult, RebacError> {
     let published = engine
-        .put_schema(&scope.keldra_tenant_id, schema_id, schema)
+        .put_schema(&scope.storage_tenant_id, schema_id, schema)
         .await?;
     engine
         .bind_schema(scope, published.schema_ref, expected_generation)

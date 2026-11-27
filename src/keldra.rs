@@ -31,8 +31,8 @@ use tonic::{Code, Status};
 
 use crate::{
     AuthzRevision, AuthzScope, BindSchemaResult, BindingGeneration, CheckDecision, CheckManyResult,
-    Consistency, KeldraStorageTenantId, MutateTuplesResult, ObjectId, PermissionRule,
-    PutSchemaResult, RebacEngine, RebacError, SchemaBinding, SchemaId, SchemaRef, SchemaRevision,
+    Consistency, MutateTuplesResult, ObjectId, PermissionRule, PutSchemaResult, RebacEngine,
+    RebacError, SchemaBinding, SchemaId, SchemaRef, SchemaRevision, StorageTenantId,
     TypedCheckRequest as CheckRequest, TypedMutateTuplesRequest as MutateTuplesRequest,
     TypedNamespaceDefinition as NamespaceDefinition, TypedObject as Object,
     TypedObjectFilter as ObjectFilter, TypedReadTuplesPage as ReadTuplesPage,
@@ -48,6 +48,21 @@ const MAX_CHECKS: usize = 1_000;
 const MAX_PAGE_SIZE: u32 = 1_000;
 const KELDRA_PUBLIC_NAMESPACE: &str = "app";
 const KELDRA_PUBLIC_ID: &str = "_keldra/public";
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct KeldraTenantId(pub String);
+
+impl From<&str> for KeldraTenantId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+impl From<String> for KeldraTenantId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
 
 mod sealed {
     pub trait Identity {}
@@ -109,7 +124,7 @@ impl IdentityCodec for ObjectId {
 #[derive(Clone)]
 pub struct KeldraRebacConfig {
     pub endpoint: String,
-    pub storage_tenant: KeldraStorageTenantId,
+    pub storage_tenant: KeldraTenantId,
     pub client_id: String,
     pub client_secret: String,
 }
@@ -254,10 +269,7 @@ impl<I> TypedKeldraRebacEngine<I> {
         })
     }
 
-    fn validate_storage_tenant(
-        &self,
-        storage_tenant: &KeldraStorageTenantId,
-    ) -> Result<(), RebacError> {
+    fn validate_storage_tenant(&self, storage_tenant: &KeldraTenantId) -> Result<(), RebacError> {
         if storage_tenant != &self.session.config.storage_tenant {
             return Err(RebacError::PermissionDenied(
                 "authorization tenant does not match the authenticated Keldra tenant".into(),
@@ -267,7 +279,7 @@ impl<I> TypedKeldraRebacEngine<I> {
     }
 
     fn validate_scope(&self, scope: &AuthzScope) -> Result<(), RebacError> {
-        self.validate_storage_tenant(&scope.keldra_tenant_id)
+        self.validate_storage_tenant(&KeldraTenantId(scope.storage_tenant_id.0.clone()))
     }
 }
 
@@ -275,11 +287,11 @@ impl<I> TypedKeldraRebacEngine<I> {
 impl<I: IdentityCodec> RebacEngine<I> for TypedKeldraRebacEngine<I> {
     async fn put_schema(
         &self,
-        storage_tenant: &KeldraStorageTenantId,
+        storage_tenant: &StorageTenantId,
         schema_id: SchemaId,
         schema: Schema<I>,
     ) -> Result<PutSchemaResult, RebacError> {
-        self.validate_storage_tenant(storage_tenant)?;
+        self.validate_storage_tenant(&KeldraTenantId(storage_tenant.0.clone()))?;
         let namespaces = schema_to_proto(&schema)?;
         let response = self
             .session
@@ -306,10 +318,10 @@ impl<I: IdentityCodec> RebacEngine<I> for TypedKeldraRebacEngine<I> {
 
     async fn get_schema(
         &self,
-        storage_tenant: &KeldraStorageTenantId,
+        storage_tenant: &StorageTenantId,
         schema_ref: &SchemaRef,
     ) -> Result<(SchemaRef, Schema<I>), RebacError> {
-        self.validate_storage_tenant(storage_tenant)?;
+        self.validate_storage_tenant(&KeldraTenantId(storage_tenant.0.clone()))?;
         let response = self
             .session
             .client()
@@ -568,7 +580,7 @@ fn validate_config(config: &KeldraRebacConfig) -> Result<(), RebacError> {
 
 fn scope_to_proto(scope: &AuthzScope) -> ProtoScope {
     ProtoScope {
-        storage_tenant: scope.keldra_tenant_id.0.clone(),
+        storage_tenant: scope.storage_tenant_id.0.clone(),
         realm: scope.authz_realm_id.0.clone(),
     }
 }

@@ -3,12 +3,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex;
-use zanzibar::keldra::{KeldraRebacConfig, KeldraRebacEngine};
+use zanzibar::keldra::{KeldraRebacConfig, KeldraRebacEngine, KeldraTenantId};
 use zanzibar::{
-    AuthzScope, CheckRequest, Consistency, KeldraStorageTenantId, MutateTuplesRequest,
-    NamespaceDefinition, Object, ObjectFilter, PermissionRule, ReadTuplesRequest, RebacEngine,
-    RebacError, RelationDefinition, Schema, SchemaBuilder, SchemaId, Subject, SubjectSelector,
-    Tuple, TupleFilter, TupleUpdate,
+    AuthzScope, CheckRequest, Consistency, MutateTuplesRequest, NamespaceDefinition, Object,
+    ObjectFilter, PermissionRule, ReadTuplesRequest, RebacEngine, RebacError, RelationDefinition,
+    Schema, SchemaBuilder, SchemaId, StorageTenantId, Subject, SubjectSelector, Tuple, TupleFilter,
+    TupleUpdate,
 };
 
 static KELDRA_E2E_LOCK: Mutex<()> = Mutex::const_new(());
@@ -143,12 +143,11 @@ fn selector_and_traversal_schema() -> Schema {
         .build()
 }
 
-async fn engine() -> (KeldraRebacEngine, KeldraStorageTenantId) {
+async fn engine() -> (KeldraRebacEngine, KeldraTenantId) {
     let endpoint = std::env::var("KELDRA_E2E_GRPC")
         .expect("KELDRA_E2E_GRPC must point to a Keldra 0.20.0 public endpoint");
-    let storage_tenant = KeldraStorageTenantId(
-        std::env::var("KELDRA_E2E_TENANT").expect("KELDRA_E2E_TENANT must be set"),
-    );
+    let storage_tenant =
+        KeldraTenantId(std::env::var("KELDRA_E2E_TENANT").expect("KELDRA_E2E_TENANT must be set"));
     let client_id =
         std::env::var("KELDRA_E2E_CLIENT_ID").expect("KELDRA_E2E_CLIENT_ID must be set");
     let client_secret =
@@ -165,14 +164,10 @@ async fn engine() -> (KeldraRebacEngine, KeldraStorageTenantId) {
     (engine, storage_tenant)
 }
 
-async fn publish_and_bind(
-    engine: &KeldraRebacEngine,
-    tenant: &KeldraStorageTenantId,
-    scope: &AuthzScope,
-) {
+async fn publish_and_bind(engine: &KeldraRebacEngine, tenant: &KeldraTenantId, scope: &AuthzScope) {
     let published = engine
         .put_schema(
-            tenant,
+            &StorageTenantId(tenant.0.clone()),
             SchemaId(unique_id("schema")),
             authorization_schema(),
         )
@@ -191,21 +186,32 @@ async fn schema_lifecycle_and_server_side_checks_use_one_revision() {
     let (engine, tenant) = engine().await;
     let schema = authorization_schema();
     let schema_id = SchemaId(unique_id("schema-lifecycle"));
-    let scope = AuthzScope::new(tenant.clone(), unique_id("realm-lifecycle"));
+    let scope = AuthzScope::new(
+        StorageTenantId(tenant.0.clone()),
+        unique_id("realm-lifecycle"),
+    );
 
     let published = engine
-        .put_schema(&tenant, schema_id.clone(), schema.clone())
+        .put_schema(
+            &StorageTenantId(tenant.0.clone()),
+            schema_id.clone(),
+            schema.clone(),
+        )
         .await
         .expect("publish schema");
 
     let identical = engine
-        .put_schema(&tenant, schema_id, schema.clone())
+        .put_schema(
+            &StorageTenantId(tenant.0.clone()),
+            schema_id,
+            schema.clone(),
+        )
         .await
         .expect("publish identical schema content");
     assert_eq!(identical.schema_ref, published.schema_ref);
 
     let (loaded_ref, loaded_schema) = engine
-        .get_schema(&tenant, &published.schema_ref)
+        .get_schema(&StorageTenantId(tenant.0.clone()), &published.schema_ref)
         .await
         .expect("load the exact immutable schema");
     assert_eq!(loaded_ref, published.schema_ref);
@@ -286,10 +292,13 @@ async fn exact_same_resource_public_and_tuple_to_userset_work_end_to_end() {
     let _guard = KELDRA_E2E_LOCK.lock().await;
     let (engine, tenant) = engine().await;
     let schema = selector_and_traversal_schema();
-    let scope = AuthzScope::new(tenant.clone(), unique_id("realm-selectors"));
+    let scope = AuthzScope::new(
+        StorageTenantId(tenant.0.clone()),
+        unique_id("realm-selectors"),
+    );
     let published = engine
         .put_schema(
-            &tenant,
+            &StorageTenantId(tenant.0.clone()),
             SchemaId(unique_id("schema-selectors")),
             schema.clone(),
         )
@@ -300,7 +309,7 @@ async fn exact_same_resource_public_and_tuple_to_userset_work_end_to_end() {
         .await
         .expect("bind selector and traversal schema");
     let (_, loaded) = engine
-        .get_schema(&tenant, &published.schema_ref)
+        .get_schema(&StorageTenantId(tenant.0.clone()), &published.schema_ref)
         .await
         .expect("load canonical selector and traversal schema");
     assert_eq!(loaded, schema);
@@ -377,7 +386,10 @@ async fn exact_same_resource_public_and_tuple_to_userset_work_end_to_end() {
 async fn distinct_mutations_update_relationships_and_tuple_reads_paginate() {
     let _guard = KELDRA_E2E_LOCK.lock().await;
     let (engine, tenant) = engine().await;
-    let scope = AuthzScope::new(tenant.clone(), unique_id("realm-mutations"));
+    let scope = AuthzScope::new(
+        StorageTenantId(tenant.0.clone()),
+        unique_id("realm-mutations"),
+    );
     publish_and_bind(&engine, &tenant, &scope).await;
 
     let alice_viewer = tuple("guide", "viewer", user("alice"));
@@ -479,7 +491,10 @@ async fn distinct_mutations_update_relationships_and_tuple_reads_paginate() {
 async fn invalid_batches_are_atomic_and_tenant_mismatches_fail_closed() {
     let _guard = KELDRA_E2E_LOCK.lock().await;
     let (engine, tenant) = engine().await;
-    let scope = AuthzScope::new(tenant.clone(), unique_id("realm-atomicity"));
+    let scope = AuthzScope::new(
+        StorageTenantId(tenant.0.clone()),
+        unique_id("realm-atomicity"),
+    );
     publish_and_bind(&engine, &tenant, &scope).await;
 
     let empty = MutateTuplesRequest::new(scope.clone(), Vec::new());
@@ -541,7 +556,10 @@ async fn invalid_batches_are_atomic_and_tenant_mismatches_fail_closed() {
 async fn posthorn_subject_page_filters_before_pagination_and_keeps_its_revision() {
     let _guard = KELDRA_E2E_LOCK.lock().await;
     let (engine, tenant) = engine().await;
-    let scope = AuthzScope::new(tenant.clone(), unique_id("realm-subject-page"));
+    let scope = AuthzScope::new(
+        StorageTenantId(tenant.0.clone()),
+        unique_id("realm-subject-page"),
+    );
     let schema = SchemaBuilder::new()
         .namespace("user", NamespaceDefinition::new())
         .namespace("service", NamespaceDefinition::new())
@@ -578,7 +596,11 @@ async fn posthorn_subject_page_filters_before_pagination_and_keeps_its_revision(
         )
         .build();
     let published = engine
-        .put_schema(&tenant, SchemaId(unique_id("schema-subject-page")), schema)
+        .put_schema(
+            &StorageTenantId(tenant.0.clone()),
+            SchemaId(unique_id("schema-subject-page")),
+            schema,
+        )
         .await
         .expect("publish subject-page schema");
     engine
